@@ -36,26 +36,49 @@ const INTELLIGENCE_UI_TIMING = Object.freeze({
   menuCloseSettleMs: 180,
 });
 
+function knownEffortId(value = '') {
+  const id = DOM_PARSER.canonicalEffortId?.(value) || '';
+  return ['instant', 'low', 'medium', 'high', 'xhigh', 'auto'].includes(id) ? id : '';
+}
+
+function intelligencePickerTriggerForContent(pickerContent) {
+  const menu = pickerContent?.closest?.('[role="menu"]')
+    || (pickerContent?.getAttribute?.('role') === 'menu' ? pickerContent : null);
+  const labelledBy = pickerContent?.getAttribute?.('aria-labelledby')
+    || menu?.getAttribute?.('aria-labelledby')
+    || '';
+  const labelled = labelledBy ? document.getElementById(labelledBy) : null;
+  const composer = findComposer();
+  const composerRoot = findComposerRootStrict() || composer?.closest?.('form') || composer?.parentElement || null;
+  if (labelled
+    && labelled.getAttribute?.('aria-expanded') === 'true'
+    && isComposerIntelligenceTriggerCandidate(labelled, composer, composerRoot)) return labelled;
+
+  return intelligencePickerTriggerCandidates()
+    .find((candidate) => candidate.element.getAttribute?.('aria-expanded') === 'true')
+    ?.element || null;
+}
+
 function visibleIntelligencePickerContent() {
   const tagged = Array.from(document.querySelectorAll('[data-testid="composer-intelligence-picker-content"]'))
     .find((element) => isVisible(element) && isPrimaryChatSurfaceElement(element));
   if (tagged) return tagged;
 
   // ChatGPT's Radix menu can be mounted before the product-specific test id is
-  // attached (and some deployments omit it entirely). Bind the portal back to
-  // the composer trigger so another visible menu cannot be mistaken for the
-  // intelligence picker during startup hydration.
+  // attached (and some deployments omit it entirely). Bind both legacy radio
+  // menus and the current effort-slider surface back to the composer trigger.
   return Array.from(document.querySelectorAll('[role="menu"][data-state="open"], [role="menu"]'))
     .filter((element) => isVisible(element) && isPrimaryChatSurfaceElement(element))
     .find((element) => {
-      if (!element.querySelector?.('[role="menuitemradio"]')) return false;
-      if (!element.querySelector?.('[role="menuitem"][data-has-submenu], [role="menuitem"][aria-haspopup="menu"]')) return false;
-      const labelledBy = element.getAttribute?.('aria-labelledby') || '';
-      const trigger = labelledBy ? document.getElementById(labelledBy) : null;
-      if (!trigger || trigger.getAttribute?.('aria-expanded') !== 'true') return false;
-      const composer = findComposer();
-      const composerRoot = findComposerRootStrict() || composer?.closest?.('form') || composer?.parentElement || null;
-      return isComposerIntelligenceTriggerCandidate(trigger, composer, composerRoot);
+      const hasSlider = Boolean(element.querySelector?.(
+        '[role="slider"], [data-testid="composer-model-picker-slider-simple-view"]',
+      ));
+      const hasLegacyOptions = Boolean(
+        element.querySelector?.('[role="menuitemradio"]')
+        && element.querySelector?.('[role="menuitem"][data-has-submenu], [role="menuitem"][aria-haspopup="menu"]'),
+      );
+      if (!hasSlider && !hasLegacyOptions) return false;
+      return Boolean(intelligencePickerTriggerForContent(element));
     }) || null;
 }
 
@@ -150,9 +173,12 @@ function intelligencePickerTriggerCandidates() {
       if (!isComposerIntelligenceTriggerCandidate(element, composer, composerRoot)) continue;
       const signal = `${buttonSignalText(element)} ${element.getAttribute('aria-controls') || ''}`;
       const hasMenu = element.getAttribute('aria-haspopup') === 'menu';
+      const descriptor = intelligenceOptionFromElement(element);
+      const effortId = knownEffortId(descriptor.label) || knownEffortId(descriptor.rawText);
       let score = 0;
       if (/composer-intelligence-picker-content|intelligence|reasoning-effort/i.test(signal)) score += 100;
-      if (/instant|medium|high|thinking|reasoning|model|gpt|средн|высок|размыш|модель|интеллект/i.test(signal)) score += 35;
+      if (effortId) score += 60;
+      if (/instant|medium|high|thinking|reasoning|model|gpt|средн|высок|мгнов|быстр|низк|размыш|модель|интеллект/i.test(signal)) score += 35;
       if (hasMenu) score += 20;
       if (element.hasAttribute('aria-expanded')) score += 8;
       if (composerRoot?.contains?.(element)) score += 20;
@@ -280,8 +306,14 @@ function effortOptionsRoot(pickerContent) {
   return directGroups[0] || pickerContent;
 }
 
-function visibleEmbeddedModelView(pickerContent) {
+function mountedEmbeddedModelView(pickerContent) {
   const view = pickerContent?.querySelector?.('[data-testid="composer-model-picker-slider-advanced-view"]') || null;
+  if (!view) return null;
+  return view.querySelector?.('[role="menuitemradio"]') ? view : null;
+}
+
+function visibleEmbeddedModelView(pickerContent) {
+  const view = mountedEmbeddedModelView(pickerContent);
   if (!view) return null;
   const visibleOptions = Array.from(view.querySelectorAll?.('[role="menuitemradio"]') || []).filter(isVisible);
   return visibleOptions.length ? view : null;
@@ -323,15 +355,35 @@ function effortSliderTickPoints(surface) {
 function effortSliderOptions(pickerContent) {
   const surface = effortSliderSurface(pickerContent);
   if (!surface) return { surface: null, options: [] };
+  const trigger = intelligencePickerTriggerForContent(pickerContent);
+  const triggerDescriptor = trigger ? intelligenceOptionFromElement(trigger) : null;
   const toggleDescriptor = surface.toggle ? intelligenceOptionFromElement(surface.toggle) : null;
+  const currentLabel = [
+    triggerDescriptor?.rawText || triggerDescriptor?.label || '',
+    toggleDescriptor?.rawText || toggleDescriptor?.label || '',
+  ].filter(Boolean).join('\n');
   const points = effortSliderTickPoints(surface);
-  const resolved = DOM_PARSER.resolveEffortSliderOptions(toggleDescriptor?.rawText || toggleDescriptor?.label || '', points.length);
+  const resolved = DOM_PARSER.resolveEffortSliderOptions(currentLabel, points.length);
   const options = resolved.efforts.map((option, index) => ({ ...option, element: surface.root, point: points[index] }));
   return { surface, options };
 }
 
 async function selectEffortSliderOption(surface, option) {
   if (!surface || !option?.point) return false;
+  const rectFor = (element) => {
+    const rect = element?.getBoundingClientRect?.();
+    return rect ? { left: rect.left, top: rect.top, width: rect.width, height: rect.height } : null;
+  };
+  diagnostic('effort.slider.selection_geometry', {
+    requested: option.id,
+    point: option.point,
+    root: rectFor(surface.root),
+    slider: rectFor(surface.slider),
+    control: rectFor(surface.control),
+    visibleTicks: Array.from(surface.root?.querySelectorAll?.('span') || [])
+      .filter((element) => element !== surface.slider && !element.children?.length && isVisible(element))
+      .slice(0, 16).map(rectFor),
+  });
   try { surface.root.scrollIntoView?.({ block: 'nearest', inline: 'nearest' }); } catch {}
   try { surface.root.focus?.({ preventScroll: true }); } catch {}
   dispatchSinglePointerClick(surface.root, { clientX: option.point.x, clientY: option.point.y });
@@ -346,6 +398,9 @@ async function selectEffortSliderOption(surface, option) {
   for (const key of keys) {
     try { keyboardTarget.dispatchEvent(new KeyboardEvent('keydown', { key, code: key, bubbles: true, cancelable: true })); } catch {}
     try { keyboardTarget.dispatchEvent(new KeyboardEvent('keyup', { key, code: key, bubbles: true, cancelable: true })); } catch {}
+    // React can batch consecutive arrow events against the same slider value.
+    // Let each step commit before sending the next one, especially for High.
+    await delay(80);
   }
   return true;
 }
@@ -468,12 +523,13 @@ async function openModelSubmenu(pickerContent) {
   return { submenu, opener };
 }
 
-function collectRadioOptions(root, kind) {
+function collectRadioOptions(root, kind, { visibleOnly = true } = {}) {
   if (!root?.querySelectorAll) return [];
   const seen = new Set();
   const elements = [];
   const descriptors = [];
-  for (const element of Array.from(root.querySelectorAll('[role="menuitemradio"]')).filter(isVisible)) {
+  const candidates = Array.from(root.querySelectorAll('[role="menuitemradio"]'));
+  for (const element of visibleOnly ? candidates.filter(isVisible) : candidates) {
     const descriptor = intelligenceOptionFromElement(element);
     const key = normalizeComparable(descriptor.rawText || descriptor.label);
     if (!key || seen.has(key)) continue;
@@ -550,20 +606,34 @@ async function readIntelligenceState({ includeModels = true } = {}) {
 
     let modelsWithElements = [];
     if (includeModels) {
-      const opened = await openModelSubmenu(pickerContent);
-      if (opened.submenu) {
-        const submenuResolver = () => visibleModelSubmenu(pickerContent, opener) || opened.submenu;
-        modelsWithElements = await waitForStableRadioOptions(submenuResolver, 'model');
-        if (!modelsWithElements.length) {
-          diagnostic('model.submenu.empty_retry', {
-            trigger: triggerDescriptor?.rawText || '',
-            action: 'read-only-hover-and-rescan',
+      const mountedEmbedded = mountedEmbeddedModelView(pickerContent);
+      if (mountedEmbedded) {
+        modelsWithElements = collectRadioOptions(mountedEmbedded, 'model', { visibleOnly: false });
+        if (modelsWithElements.length) {
+          diagnostic('model.embedded.mounted_read', {
+            count: modelsWithElements.length,
+            active: mountedEmbedded.getAttribute?.('data-active') || '',
+            inert: mountedEmbedded.hasAttribute?.('inert') || false,
           });
-          // Give a late Radix/React mount one extra read-only window. Do not
-          // activate or click the submenu opener again in this state read.
-          maintainModelSubmenuHover(opener);
-          await delay(INTELLIGENCE_UI_TIMING.verificationRetryMs);
+        }
+      }
+
+      if (!modelsWithElements.length) {
+        const opened = await openModelSubmenu(pickerContent);
+        if (opened.submenu) {
+          const submenuResolver = () => visibleModelSubmenu(pickerContent, opener) || opened.submenu;
           modelsWithElements = await waitForStableRadioOptions(submenuResolver, 'model');
+          if (!modelsWithElements.length) {
+            diagnostic('model.submenu.empty_retry', {
+              trigger: triggerDescriptor?.rawText || '',
+              action: 'read-only-hover-and-rescan',
+            });
+            // Give a late Radix/React mount one extra read-only window. Do not
+            // activate or click the submenu opener again in this state read.
+            maintainModelSubmenuHover(opener);
+            await delay(INTELLIGENCE_UI_TIMING.verificationRetryMs);
+            modelsWithElements = await waitForStableRadioOptions(submenuResolver, 'model');
+          }
         }
       }
       if (!modelsWithElements.length) throw new Error('DOM_SCHEMA_CHANGED: transient model submenu was not found or contained no models.');
@@ -705,8 +775,10 @@ async function handleEffortsList(payload) {
       handleEffortsList,
       intelligencePickerTriggerCandidates,
       isComposerIntelligenceTriggerCandidate,
+      intelligencePickerTriggerForContent,
       modelSubmenuOpener,
       effortSliderOptions,
+      selectEffortSliderOption,
       visibleIntelligencePickerContent,
       waitForIntelligencePickerTriggerCandidates,
       openIntelligencePicker,

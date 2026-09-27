@@ -394,6 +394,7 @@ function isMeaningfulVisibleElement(element) {
   if (!element.querySelector?.('[data-message-author-role="assistant"]')
     && element.querySelector?.('[data-testid="copy-turn-action-button"]')) return false;
   const text = visibleText(element);
+  if (DOM_PARSER.isAssistantAuthorLabel(text)) return false;
   return Boolean(text || element.querySelector?.('pre, code, img, a[href], button, [role="status"], [aria-live], [data-testid^="cot-v5-"]'));
 }
 
@@ -420,7 +421,7 @@ function findTemporaryMessageStack(turn) {
     const children = Array.from(current.children || []).filter(isMeaningfulVisibleElement);
     if (children.length !== 1) break;
     const child = children[0];
-    if (child.matches?.('[data-testid^="cot-v5-"], [role="status"], [aria-live], pre, code')) break;
+    if (child.matches?.('[data-testid^="cot-v5-"], [role="status"], [aria-live], [aria-busy="true"], pre, code')) break;
     current = child;
   }
   return current;
@@ -526,6 +527,17 @@ function thinkingLabelText(element) {
   return normalizeText(clone.innerText || clone.textContent || '');
 }
 
+function stripNestedThinkingLabels(value, labels = []) {
+  let output = normalizeText(value);
+  for (const label of [...new Set(labels.map(normalizeText).filter(Boolean))].sort((a, b) => b.length - a.length)) {
+    const pattern = label.split(/\s+/)
+      .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+      .join('\\s+');
+    output = normalizeText(output.replace(new RegExp(`(^|\\s+)${pattern}(?=\\s+|$)`, 'giu'), '$1'));
+  }
+  return output.replace(/\n{2,}/g, '\n');
+}
+
 function isReasoningTransitionContext(element, turn, finalNode) {
   if (!element || !turn?.contains?.(element)) return false;
   if (hasClassToken(element, 'loading-shimmer-tertiary')) return true;
@@ -616,7 +628,7 @@ function readVisibleBlock(element, index, finalNode = null) {
     state: element.getAttribute?.('data-state') || null,
     ariaBusy: element.getAttribute?.('aria-busy') || null,
     expanded: element.hasAttribute?.('aria-expanded') ? element.getAttribute('aria-expanded') === 'true' : null,
-    hasCode: Boolean(element.matches?.('pre, code') || element.querySelector?.('pre, code')),
+    hasCode: Boolean(element.matches?.('pre, code') || element.querySelector?.('pre')),
     active: !final && blockIsActive(element),
     key: `${testIds[0] || element.tagName || 'block'}:${simpleHash(`${testIds.join('|')}|${text}`)}`,
     nodeToken: thinkingNodeToken(element),
@@ -776,8 +788,16 @@ function readAssistantNodeSnapshot(node, meta = {}) {
     if (exactDuplicate || ownedByExplicitRoot) return null;
 
     const nested = overlaps.filter((candidate) => element?.contains?.(candidate._element));
-    const candidateText = nested.length
-      ? DOM_PARSER.stripTrailingNestedProgressLabels(block.text, nested.map((candidate) => candidate.text))
+    // Animated transition branches can have opacity zero while their text still
+    // appears in an ancestor's innerText. Remove every nested reasoning label,
+    // including those which did not pass isVisible(), from the broad wrapper.
+    const nestedLabels = [
+      ...nested.map((candidate) => candidate.text),
+      ...Array.from(element?.querySelectorAll?.('.loading-shimmer-tertiary') || [])
+        .map((child) => normalizeText(child.textContent || '')),
+    ];
+    const candidateText = nestedLabels.length
+      ? stripNestedThinkingLabels(block.text, nestedLabels)
       : block.text;
     const active = Boolean(block.active || nested.some((candidate) => candidate.active));
     return {
@@ -802,6 +822,7 @@ function readAssistantNodeSnapshot(node, meta = {}) {
   const reasoningHistory = progressItems.filter((item) => item.state === 'completed' && item.kind === 'thinking');
   const artifacts = collectArtifactsForAssistantNode(parseRoot, meta);
   const { answer, format, responseBlocks, codeBlocks, codeBlockDiagnostics, parserAudit } = extractFinalAnswer(finalNode, explicitThinking.map((candidate) => candidate._exclusionRoot || candidate._element));
+  const diagnosticParserAudit = parserAudit || (meta.captureSourceHtml ? { version: 1 } : null);
   const raw = visibleText(parseRoot);
   const stopVisible = Boolean(findStopButton(finalizationControlRoots(getActiveRequest(), { turnKey: meta.turnKey || turnKey(turn, meta.turnIndex ?? -1) })));
   const streamingVisible = Boolean(parseRoot?.matches?.('.streaming-animation') || parseRoot?.querySelector?.('.streaming-animation'));
@@ -833,13 +854,13 @@ function readAssistantNodeSnapshot(node, meta = {}) {
     needsContinue,
     hasError: errorState.hasError || failedArtifacts.length > 0,
   });
-  if (parserAudit?.coverage) parserAudit.coverage.reasoningLeaves = progressItems.filter((item) => item.kind === 'thinking' && item.text).length;
-  if (parserAudit && finalNode) {
+  if (diagnosticParserAudit?.coverage) diagnosticParserAudit.coverage.reasoningLeaves = progressItems.filter((item) => item.kind === 'thinking' && item.text).length;
+  if (diagnosticParserAudit) {
     // Source HTML is a diagnostic fixture, not part of the normal observation
     // projection. Cloning and sanitizing the final answer on every poll or
     // composer mutation caused long main-thread stalls on large responses.
-    if (meta.captureSourceHtml) parserAudit.sourceHtml = safeOuterHtml(parseRoot, 250_000, { captureFixture: true });
-    parserAudit.sourceDomPath = domPathForNode(finalNode, parseRoot);
+    if (meta.captureSourceHtml) diagnosticParserAudit.sourceHtml = safeOuterHtml(parseRoot, 250_000, { captureFixture: true });
+    if (finalNode) diagnosticParserAudit.sourceDomPath = domPathForNode(finalNode, parseRoot);
   }
   const snapshot = {
     answer,
@@ -855,7 +876,7 @@ function readAssistantNodeSnapshot(node, meta = {}) {
     responseBlocks,
     codeBlocks,
     codeBlockDiagnostics,
-    parserAudit,
+    parserAudit: diagnosticParserAudit,
     artifacts,
     reason: meta.reason || (finalNode ? 'final_author_node' : hasReadyGeneratedImage ? 'generated_image_artifact' : 'assistant_turn_without_final'),
     turnKey: meta.turnKey || turnKey(turn, meta.turnIndex ?? -1) || finalNode?.getAttribute?.('data-message-id') || '',

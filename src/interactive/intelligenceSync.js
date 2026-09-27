@@ -103,6 +103,7 @@ export class InteractiveIntelligenceSync {
 
     this.running = (async () => {
       try {
+        const recoveringFromWait = this.waitingNoticeKey === active.id;
         const listed = await bridge.listModels({ sourceClientId: active.id, timeoutMs: 12_000 });
         let snapshot = intelligenceSnapshot(listed);
         if (!snapshot.efforts.length || !snapshot.effort) {
@@ -126,6 +127,13 @@ export class InteractiveIntelligenceSync {
             kind: 'system',
             title: 'ChatGPT effort synchronized',
             body: `${snapshot.effort || 'unknown'} → ${desired.effort}\nProject setting applied`,
+          });
+        }
+        if (recoveringFromWait) {
+          this.runtime.pushEntry({
+            kind: 'system',
+            title: 'ChatGPT model/effort ready',
+            body: 'The connected ChatGPT tab finished loading its model and effort controls.',
           });
         }
         this.lastError = '';
@@ -178,7 +186,7 @@ export class InteractiveIntelligenceSync {
   #shouldRetryConnectedIntelligenceRead(error, clientId) {
     const message = String(error?.message || error || '');
     const transient = /Timed out waiting for (?:models\.list|efforts\.list|intelligence\.apply) response/i.test(message)
-      || /DOM_SCHEMA_CHANGED:\s*intelligence picker content was not found/i.test(message);
+      || /DOM_SCHEMA_CHANGED:\s*(?:intelligence picker content|intelligence effort options|current model submenu trigger|transient model submenu)\b/i.test(message);
     if (!transient) return false;
     const health = this.runtime.options.bridge.health();
     return Array.from(health.clients || []).some((client) => String(client?.id || '') === String(clientId || ''));

@@ -141,6 +141,7 @@ export class BrowserBridge {
       this.#hub.on?.('client.activity', (data) => canonicalHandler({ eventName: 'client.activity', data }));
     }
     this.#hub.on?.('client.ready', (client) => this.#clientEvents.handleClientReady(client));
+    this.#hub.on?.('client.changed', (client) => this.#clientEvents.handleClientChanged(client));
     this.#hub.on?.('client.closed', (client) => this.#lifecycle.handleClientClosed(client));
   }
 
@@ -268,6 +269,12 @@ export class BrowserBridge {
 
   selectClient(clientId) {
     return this.#hub.selectClient(clientId);
+  }
+
+  async identifyBrowserTab(clientId = '', options = {}) {
+    const sourceClientId = String(clientId || options.sourceClientId || this.#hub.activeClient?.id || '').trim();
+    if (!sourceClientId) throw new Error('No active browser tab is available to identify');
+    return await this.#operations.identifyBrowserTab({ ...options, sourceClientId });
   }
 
   clearSelectedClient() {
@@ -496,5 +503,4 @@ export class BrowserBridge {
   #sendCommand(type, payload = {}, options = {}) {
     return this.#commandRegistry.send(type, payload, options);
   }
-
 }
