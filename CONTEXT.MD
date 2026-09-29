@@ -15,6 +15,17 @@ Current release contract:
 
 No polling, page-context WebSocket, userscript transport, protocol downgrade, alternate request lifecycle, job API, or alternate interactive runtime remains.
 
+## Request and storage failure boundaries
+
+- Queued coordinator effects are invalidated by canonical terminal evidence, runtime completion, explicit cleanup, and shutdown. Each dispatch has its own token so late completion cannot erase a replacement registration. Synchronous executor exceptions use the same error boundary as rejected promises.
+- Effect correlation is registered before started-event publication and physical execution. Cancellation before dispatch never invokes the handler. Steering is single-flight per request and revalidates source ownership and canonical state after readiness and physical settlement.
+- Command rejection is a failure for both result and effect commands. Command dispatch rechecks cancellation and shutdown after release waiting, refuses occupied command IDs, and detaches abort listeners at settlement.
+- FileStore serializes mutations and descriptor acquisition. Artifact replacement writes a separate version, commits the new index atomically, and only then publishes the record and retires the previous bytes. Failed commits preserve previous records and source files; public metadata is detached from stored state. Removal and pruning commit the index before deleting bytes.
+- Artifact deletion and clear invalidate pending image captures. Their late results cannot settle replacement candidates or republish deleted identities.
+- Remote observation readers retain their own abort controller across cursor hydration, cancel and unlock on every exit, and reject connection waiters on shutdown. Aborted readers cannot acknowledge newly received turns. Cursor files use the shared atomic JSON writer.
+
+The behavioral regressions are included in the full suite, release fault matrix, and local sandbox contract matrix. Browser compatibility still requires separate live verification; offline work uses captured DOM fixtures and the deterministic mock runtime.
+
 ## 2.4.3 stable browser-tab identity
 
 - Protocol 5 client identity now uses only the real Chrome `tabId` when one is available (`extension:tab:<id>`). The content-generated ID remains diagnostic as `contentClientId`.
