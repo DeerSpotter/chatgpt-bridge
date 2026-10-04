@@ -217,11 +217,16 @@ function protocolForTools(tools) {
     'LOCAL AGENT BRIDGE:',
     'You are connected to the user\'s real local Codex workspace. Codex remains the authority that executes tools, applies sandbox/approval policy, and accesses the project directory. Do not claim that you ran, read, changed, viewed, delegated, or queried anything unless you request a local tool and receive its LOCAL TOOL RESULT.',
     'Use only tools listed in the ADVERTISED CODEX TOOLS catalog below. Never invent a tool name or argument.',
+    'PREFERRED RENDER-SAFE FUNCTION CALL: output exactly one line and nothing after it:',
+    'LOCAL_TOOL_CALL: {"name":"<advertised-function-name>","arguments":{}}',
+    'PREFERRED RENDER-SAFE CUSTOM CALL: output exactly one line and nothing after it:',
+    'LOCAL_CUSTOM_TOOL_CALL: {"name":"<advertised-custom-tool-name>","input":"<freeform input with newlines JSON-escaped>"}',
+    'These LOCAL_* lines are preferred because they survive rendered browser text extraction. Fill arguments exactly according to the advertised schema.',
   ];
 
   if (shell) {
     lines.push(
-      'FAST PATH — shell: to run one command, respond with exactly one fenced `run` block and nothing after it:',
+      'COMPATIBILITY FAST PATH — shell: a fenced `run` block is also accepted:',
       '```run',
       '<one shell command>',
       '```',
@@ -231,7 +236,7 @@ function protocolForTools(tools) {
 
   if (patch) {
     lines.push(
-      'FAST PATH — patch: to apply a patch, respond with exactly one fenced `patch` block and nothing after it:',
+      'COMPATIBILITY FAST PATH — patch: a fenced `patch` block is also accepted:',
       '```patch',
       '*** Begin Patch',
       '...',
@@ -242,16 +247,9 @@ function protocolForTools(tools) {
   }
 
   lines.push(
-    'GENERAL FUNCTION TOOL PATH: for any advertised function tool (including write_stdin, update_plan, view_image, agent tools, MCP tools, permission/user-input tools, or future Codex function tools), respond with exactly one fenced `tool` block and nothing after it:',
-    '```tool',
-    '{"name":"<advertised-function-name>","arguments":{}}',
-    '```',
-    'Fill arguments exactly according to that tool\'s advertised JSON schema. The bridge validates the name against the current Codex request and passes the arguments back to Codex unchanged.',
-    'GENERAL CUSTOM TOOL PATH: for any advertised custom/freeform tool, respond with exactly one fenced `custom_tool` block and nothing after it:',
-    '```custom_tool',
-    '{"name":"<advertised-custom-tool-name>","input":"<freeform input>"}',
-    '```',
-    'After every tool request, stop and wait for LOCAL TOOL RESULT before deciding the next action. When the task is complete, answer normally with no tool fence.',
+    'COMPATIBILITY GENERAL FUNCTION PATH: a fenced `tool` JSON block is also accepted.',
+    'COMPATIBILITY GENERAL CUSTOM PATH: a fenced `custom_tool` JSON block is also accepted.',
+    'After every tool request, stop and wait for LOCAL TOOL RESULT before deciding the next action. When the task is complete, answer normally with no LOCAL_* call and no tool fence.',
     'ADVERTISED CODEX TOOLS (one JSON object per line):',
     compactToolCatalog(tools),
   );
@@ -297,8 +295,58 @@ function jsonFence(source, label) {
   }
 }
 
+function taggedJson(source, tag) {
+  const prefix = `${tag}:`;
+  for (const rawLine of String(source || '').split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line.startsWith(prefix)) continue;
+    const payload = line.slice(prefix.length).trim();
+    if (!payload) return null;
+    try {
+      const parsed = JSON.parse(payload);
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function functionToolCall(payload, tools) {
+  if (!payload) return null;
+  const advertised = findAdvertisedTool(tools, payload.name);
+  const args = payload.arguments ?? payload.args;
+  if (advertised?.type !== 'function' || !args || typeof args !== 'object' || Array.isArray(args)) return null;
+  return {
+    type: 'function_call',
+    call_id: `call_${crypto.randomUUID().replaceAll('-', '')}`,
+    name: advertised.name,
+    arguments: JSON.stringify(args),
+  };
+}
+
+function customToolCall(payload, tools) {
+  if (!payload) return null;
+  const advertised = findAdvertisedTool(tools, payload.name);
+  if (advertised?.type !== 'custom' || !Object.hasOwn(payload, 'input')) return null;
+  const input = typeof payload.input === 'string' ? payload.input : JSON.stringify(payload.input);
+  return {
+    type: 'custom_tool_call',
+    call_id: `call_${crypto.randomUUID().replaceAll('-', '')}`,
+    name: advertised.name,
+    input,
+  };
+}
+
 export function parseResponsesToolCall(text, tools = []) {
   const source = String(text || '');
+
+  const taggedFunction = functionToolCall(taggedJson(source, 'LOCAL_TOOL_CALL'), tools);
+  if (taggedFunction) return taggedFunction;
+
+  const taggedCustom = customToolCall(taggedJson(source, 'LOCAL_CUSTOM_TOOL_CALL'), tools);
+  if (taggedCustom) return taggedCustom;
+
   const patchTool = findApplyPatchTool(tools);
   const patch = source.match(/```patch\s*\r?\n([\s\S]*?)```/i);
   if (patchTool?.type === 'custom' && patch?.[1]?.trim()) {
@@ -321,35 +369,11 @@ export function parseResponsesToolCall(text, tools = []) {
     };
   }
 
-  const genericFunction = jsonFence(source, 'tool');
-  if (genericFunction) {
-    const advertised = findAdvertisedTool(tools, genericFunction.name);
-    const args = genericFunction.arguments ?? genericFunction.args;
-    if (advertised?.type === 'function' && args && typeof args === 'object' && !Array.isArray(args)) {
-      return {
-        type: 'function_call',
-        call_id: `call_${crypto.randomUUID().replaceAll('-', '')}`,
-        name: advertised.name,
-        arguments: JSON.stringify(args),
-      };
-    }
-  }
+  const genericFunction = functionToolCall(jsonFence(source, 'tool'), tools);
+  if (genericFunction) return genericFunction;
 
-  const genericCustom = jsonFence(source, 'custom_tool');
-  if (genericCustom) {
-    const advertised = findAdvertisedTool(tools, genericCustom.name);
-    if (advertised?.type === 'custom' && Object.hasOwn(genericCustom, 'input')) {
-      const input = typeof genericCustom.input === 'string'
-        ? genericCustom.input
-        : JSON.stringify(genericCustom.input);
-      return {
-        type: 'custom_tool_call',
-        call_id: `call_${crypto.randomUUID().replaceAll('-', '')}`,
-        name: advertised.name,
-        input,
-      };
-    }
-  }
+  const genericCustom = customToolCall(jsonFence(source, 'custom_tool'), tools);
+  if (genericCustom) return genericCustom;
 
   return null;
 }
