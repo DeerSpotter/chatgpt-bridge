@@ -52,6 +52,36 @@ test('latest tool result becomes the next ChatGPT web turn and keeps tool identi
   assert.match(buildResponsesBridgePrompt(turn), /LOCAL TOOL RESULT from write_stdin/);
 });
 
+test('render-safe LOCAL_TOOL_CALL maps advertised exec_command', () => {
+  const call = parseResponsesToolCall(
+    'LOCAL_TOOL_CALL: {"name":"exec_command","arguments":{"cmd":"git status --short"}}',
+    [{ type: 'function', name: 'exec_command' }],
+  );
+
+  assert.equal(call.type, 'function_call');
+  assert.equal(call.name, 'exec_command');
+  assert.deepEqual(JSON.parse(call.arguments), { cmd: 'git status --short' });
+});
+
+test('render-safe LOCAL_CUSTOM_TOOL_CALL maps advertised apply_patch', () => {
+  const call = parseResponsesToolCall(
+    'LOCAL_CUSTOM_TOOL_CALL: {"name":"apply_patch","input":"*** Begin Patch\\n*** End Patch"}',
+    [{ type: 'custom', name: 'apply_patch' }],
+  );
+
+  assert.equal(call.type, 'custom_tool_call');
+  assert.equal(call.name, 'apply_patch');
+  assert.match(call.input, /Begin Patch/);
+});
+
+test('render-safe call rejects a tool Codex did not advertise', () => {
+  const call = parseResponsesToolCall(
+    'LOCAL_TOOL_CALL: {"name":"made_up_tool","arguments":{"x":1}}',
+    [{ type: 'function', name: 'exec_command' }],
+  );
+  assert.equal(call, null);
+});
+
 test('run fence maps to current Codex exec_command arguments', () => {
   const call = parseResponsesToolCall(
     '```run\ngit status --short\n```',
@@ -119,7 +149,7 @@ test('generic custom tool fence passes freeform input only for advertised custom
   assert.match(call.input, /Begin Patch/);
 });
 
-test('bridge prompt includes live advertised function schema', () => {
+test('bridge prompt includes live advertised function schema and render-safe protocol', () => {
   const prompt = buildResponsesBridgePrompt({
     kind: 'user',
     message: 'continue the process',
@@ -140,6 +170,7 @@ test('bridge prompt includes live advertised function schema', () => {
     }],
   });
 
+  assert.match(prompt, /LOCAL_TOOL_CALL/);
   assert.match(prompt, /ADVERTISED CODEX TOOLS/);
   assert.match(prompt, /write_stdin/);
   assert.match(prompt, /session_id/);
