@@ -52,7 +52,7 @@ async function waitForProvider(timeoutMs = 12_000) {
 }
 
 function startBridge() {
-  const child = spawn(process.execPath, [path.join(repoRoot, 'src', 'index.js'), '--server'], {
+  return spawn(process.execPath, [path.join(repoRoot, 'src', 'index.js'), '--server'], {
     cwd: repoRoot,
     env: {
       ...process.env,
@@ -63,7 +63,6 @@ function startBridge() {
     stdio: ['ignore', 'ignore', 'inherit'],
     windowsHide: true,
   });
-  return child;
 }
 
 function existingFile(value) {
@@ -84,30 +83,56 @@ function npmCodexEntryNear(directory) {
   return candidates.map(existingFile).find(Boolean) || '';
 }
 
-function resolveWindowsCodexLaunch() {
-  const explicit = String(process.env.CODEX_BIN || '').trim();
-  if (explicit) {
-    const absolute = path.isAbsolute(explicit) ? explicit : existingFile(path.resolve(explicit));
-    const resolved = absolute || existingFile(explicit);
-    const ext = path.extname(resolved || explicit).toLowerCase();
-    if (ext === '.js' || ext === '.mjs') {
-      return { command: process.execPath, argsPrefix: [resolved || explicit], label: resolved || explicit };
-    }
-    if (ext === '.cmd' || ext === '.bat') {
-      const entry = npmCodexEntryNear(path.dirname(resolved || explicit));
-      if (entry) return { command: process.execPath, argsPrefix: [entry], label: entry };
-      throw new Error(`CODEX_BIN points to ${ext} shim '${explicit}', but its npm Codex entrypoint was not found. Point CODEX_BIN at codex.exe or @openai/codex/bin/codex.js.`);
-    }
-    return { command: resolved || explicit, argsPrefix: [], label: resolved || explicit };
+function npmNativeCodexNear(directory) {
+  if (!directory) return '';
+  const packageRoot = path.join(directory, 'node_modules', '@openai', 'codex', 'node_modules');
+  const candidates = [
+    path.join(packageRoot, '@openai', 'codex-win32-x64', 'vendor', 'x86_64-pc-windows-msvc', 'bin', 'codex.exe'),
+    path.join(packageRoot, '@openai', 'codex-win32-arm64', 'vendor', 'aarch64-pc-windows-msvc', 'bin', 'codex.exe'),
+  ];
+  return candidates.map(existingFile).find(Boolean) || '';
+}
+
+function launchFromExplicit(explicit, variableName) {
+  const raw = String(explicit || '').trim();
+  if (!raw) return null;
+  const resolved = existingFile(path.isAbsolute(raw) ? raw : path.resolve(raw)) || existingFile(raw);
+  const target = resolved || raw;
+  const ext = path.extname(target).toLowerCase();
+  if (ext === '.js' || ext === '.mjs') {
+    return { command: process.execPath, argsPrefix: [target], label: target };
   }
+  if (ext === '.cmd' || ext === '.bat') {
+    const directory = path.dirname(target);
+    const nativeExe = npmNativeCodexNear(directory);
+    if (nativeExe) return { command: nativeExe, argsPrefix: [], label: nativeExe };
+    const entry = npmCodexEntryNear(directory);
+    if (entry) return { command: process.execPath, argsPrefix: [entry], label: entry };
+    throw new Error(`${variableName} points to ${ext} shim '${raw}', but its Codex executable/JS entrypoint was not found.`);
+  }
+  return { command: target, argsPrefix: [], label: target };
+}
+
+function resolveWindowsCodexLaunch() {
+  const explicit = launchFromExplicit(process.env.CODEX_BIN, 'CODEX_BIN')
+    || launchFromExplicit(process.env.CODEX_CLI_PATH, 'CODEX_CLI_PATH');
+  if (explicit) return explicit;
 
   const pathDirs = String(process.env.PATH || '')
     .split(path.delimiter)
-    .map((entry) => entry.replace(/^"|"$/g, '').trim())
+    .map((entry) => entry.replace(/^\"|\"$/g, '').trim())
     .filter(Boolean);
 
-  for (const directory of pathDirs) {
-    const exe = existingFile(path.join(directory, 'codex.exe'));
+  const directExeCandidates = [
+    ...pathDirs.map((directory) => path.join(directory, 'codex.exe')),
+    process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Programs', 'OpenAI', 'Codex', 'bin', 'codex.exe') : '',
+    process.env.CODEX_INSTALL_DIR ? path.join(process.env.CODEX_INSTALL_DIR, 'codex.exe') : '',
+    process.env.USERPROFILE ? path.join(process.env.USERPROFILE, '.codex', 'packages', 'standalone', 'current', 'codex.exe') : '',
+    process.env.CODEX_HOME ? path.join(process.env.CODEX_HOME, 'packages', 'standalone', 'current', 'codex.exe') : '',
+  ].filter(Boolean);
+
+  for (const candidate of directExeCandidates) {
+    const exe = existingFile(candidate);
     if (exe) return { command: exe, argsPrefix: [], label: exe };
   }
 
@@ -115,22 +140,30 @@ function resolveWindowsCodexLaunch() {
     ...pathDirs,
     process.env.APPDATA ? path.join(process.env.APPDATA, 'npm') : '',
   ].filter(Boolean);
+
   for (const directory of [...new Set(npmRoots)]) {
+    const nativeExe = npmNativeCodexNear(directory);
+    if (nativeExe) return { command: nativeExe, argsPrefix: [], label: nativeExe };
     const entry = npmCodexEntryNear(directory);
     if (entry) return { command: process.execPath, argsPrefix: [entry], label: entry };
   }
 
   const cmdShim = pathDirs.map((directory) => existingFile(path.join(directory, 'codex.cmd'))).find(Boolean);
   if (cmdShim) {
-    throw new Error(`Found Codex command shim at '${cmdShim}', but not a directly executable codex.exe or npm JS entrypoint. Set CODEX_BIN to the real codex.exe or @openai/codex/bin/codex.js path.`);
+    throw new Error(`Found Codex command shim at '${cmdShim}', but not its native executable or JS entrypoint. Set CODEX_CLI_PATH/CODEX_BIN to the real codex.exe.`);
   }
 
-  throw new Error('Codex executable was not found on PATH. Install Codex or set CODEX_BIN to codex.exe / @openai/codex/bin/codex.js.');
+  throw new Error([
+    'Codex CLI executable was not found.',
+    'The Codex desktop app alone may not expose codex.exe on PATH.',
+    'Install the Windows CLI with the official installer or set CODEX_CLI_PATH/CODEX_BIN to an existing codex.exe.',
+    'Official installer: powershell -ExecutionPolicy ByPass -c "irm https://chatgpt.com/codex/install.ps1 | iex"',
+  ].join(' '));
 }
 
 function resolveCodexLaunch() {
   if (process.platform === 'win32') return resolveWindowsCodexLaunch();
-  const explicit = String(process.env.CODEX_BIN || '').trim();
+  const explicit = String(process.env.CODEX_BIN || process.env.CODEX_CLI_PATH || '').trim();
   return { command: explicit || 'codex', argsPrefix: [], label: explicit || 'codex' };
 }
 
@@ -185,22 +218,18 @@ async function main() {
   console.log('[local] OpenAI API key billing: disabled for this provider');
   console.log(`[local] Codex harness metadata profile: ${harnessModel} (the actual web model is selected in ChatGPT)`);
 
+  const launch = resolveCodexLaunch();
+  console.log(`[local] Codex executable: ${launch.label}`);
+
   const env = { ...process.env };
   delete env.OPENAI_API_KEY;
   delete env.OPENAI_API_BASE;
   delete env.OPENAI_BASE_URL;
-  // Use an isolated Codex home by default so this launch does not inherit a
-  // ChatGPT Codex login or API credentials. Set CHATGPT_BRIDGE_USE_EXISTING_CODEX_HOME=1
-  // only when debugging a Codex build that refuses custom providers without its
-  // normal home; the provider still remains pinned to localhost.
   if (process.env.CHATGPT_BRIDGE_USE_EXISTING_CODEX_HOME !== '1') {
     env.CODEX_HOME = localCodexHome();
   }
 
-  const launch = resolveCodexLaunch();
   const codexArgs = [...launch.argsPrefix, ...buildCodexArgs(process.argv.slice(2))];
-  console.log(`[local] Codex executable: ${launch.label}`);
-
   const child = spawn(launch.command, codexArgs, {
     cwd: process.cwd(),
     env,
