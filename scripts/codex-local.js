@@ -172,6 +172,11 @@ function localCodexHome() {
   return path.join(os.homedir(), '.bridge-data', 'codex-local');
 }
 
+function ensureDirectory(directory) {
+  fs.mkdirSync(directory, { recursive: true });
+  return directory;
+}
+
 function buildCodexArgs(userArgs) {
   const overrides = [
     `model_providers.${providerId}.name=\"ChatGPT Web Local\"`,
@@ -226,7 +231,8 @@ async function main() {
   delete env.OPENAI_API_BASE;
   delete env.OPENAI_BASE_URL;
   if (process.env.CHATGPT_BRIDGE_USE_EXISTING_CODEX_HOME !== '1') {
-    env.CODEX_HOME = localCodexHome();
+    env.CODEX_HOME = ensureDirectory(localCodexHome());
+    console.log(`[local] isolated CODEX_HOME: ${env.CODEX_HOME}`);
   }
 
   const codexArgs = [...launch.argsPrefix, ...buildCodexArgs(process.argv.slice(2))];
