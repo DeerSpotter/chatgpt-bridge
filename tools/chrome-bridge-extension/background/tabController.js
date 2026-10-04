@@ -37,6 +37,10 @@ function removeTab(tabId) {
   });
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function safeChatUrl(value = '') {
   const parsed = new URL(String(value || 'https://chatgpt.com/'));
   if (!['https://chatgpt.com', 'https://chat.openai.com'].includes(parsed.origin.toLowerCase()) || parsed.username || parsed.password) {
@@ -60,25 +64,67 @@ export function createTabController({
   }
   if (typeof isStableLaunchToken !== 'function') throw new TypeError('Tab controller requires launch-token validation');
 
+  function hasConnectedTab(tabId) {
+    for (const connection of connections.values()) {
+      if (connection?.tabId === tabId && !connection?.closed) return true;
+    }
+    return false;
+  }
+
+  async function waitForConnectedTab(tabId, timeoutMs = 12_000) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (hasConnectedTab(tabId)) return true;
+      await sleep(150);
+    }
+    return hasConnectedTab(tabId);
+  }
+
   async function openBridgeTab(port, options = {}) {
     const requestedUrl = safeChatUrl(options.url || 'https://chatgpt.com/');
     const launchToken = String(options.launchToken || `bridge-tab-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`);
     const connectionServerUrl = connections.get(port)?.serverUrl || '';
     const bridgeServerUrl = safeBridgeServerUrl(options.bridgeServerUrl || connectionServerUrl);
-    const active = options.active !== false;
-    const tab = await createTab({ url: 'about:blank', active });
+    const requestedActive = options.active !== false;
+    const openerTabId = port?.sender?.tab?.id ?? null;
+
+    // Chrome can defer enough page work in a newly-created inactive ChatGPT tab
+    // that the content runtime never finishes bootstrapping until the user
+    // manually selects it. For an "inactive" bridge worker, warm it as the
+    // active tab only until its extension connection is established, then
+    // automatically restore the user's original tab. This preserves the same
+    // authenticated Chrome profile without requiring a second login/session.
+    const warmThenRestore = !requestedActive && Number.isInteger(openerTabId);
+    const tab = await createTab({ url: 'about:blank', active: warmThenRestore ? true : requestedActive });
     if (!Number.isInteger(tab?.id)) throw new Error('Chrome did not return a tab id for the new ChatGPT tab');
     try {
       // Persist ownership before navigation so a fast content connection cannot
       // announce without its one-time launch identity.
       await rememberLaunchedTab(tab.id, { launchToken, requestedUrl, createdAt: Date.now(), serverUrl: bridgeServerUrl });
-      await updateTab(tab.id, { url: requestedUrl, active });
+      await updateTab(tab.id, { url: requestedUrl, active: warmThenRestore ? true : requestedActive });
+
+      let connected = false;
+      if (warmThenRestore) {
+        connected = await waitForConnectedTab(tab.id);
+        await updateTab(openerTabId, { active: true }).catch(() => {});
+      }
+
+      return {
+        tabId: tab.id,
+        launchToken,
+        requestedUrl,
+        bridgeServerUrl,
+        active: requestedActive,
+        openerTabId,
+        warmed: warmThenRestore,
+        connectedDuringWarmup: connected,
+      };
     } catch (error) {
+      if (warmThenRestore) await updateTab(openerTabId, { active: true }).catch(() => {});
       await forgetLaunchedTab(tab.id);
       await removeTab(tab.id).catch(() => {});
       throw error;
     }
-    return { tabId: tab.id, launchToken, requestedUrl, bridgeServerUrl, active, openerTabId: port?.sender?.tab?.id ?? null };
   }
 
   async function closeOwnBridgeTab(port, options = {}) {
