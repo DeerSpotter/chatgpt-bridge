@@ -64,7 +64,7 @@ function unsupported(res, message) {
   });
 }
 
-async function collectBrowserResponse(req, bridge) {
+async function collectBrowserResponse(req, res, bridge) {
   const kind = requestKind(req);
   if (kind !== 'turn') {
     const error = new Error(`Background Codex request kind '${kind}' is disabled for the local ChatGPT web provider.`);
@@ -95,7 +95,7 @@ async function collectBrowserResponse(req, bridge) {
   const onClose = () => {
     if (!complete && !abortController.signal.aborted) abortController.abort('Codex client disconnected');
   };
-  req.on('close', onClose);
+  res.on('close', onClose);
 
   try {
     const response = await bridge.sendRequest(
@@ -116,7 +116,7 @@ async function collectBrowserResponse(req, bridge) {
     complete = true;
     return { answer: outputText(response), response, turn };
   } finally {
-    req.off('close', onClose);
+    res.off('close', onClose);
   }
 }
 
@@ -148,7 +148,7 @@ async function handleResponses(req, res) {
   const stream = req.body?.stream !== false;
 
   try {
-    const { answer, turn } = await collectBrowserResponse(req, req.app.locals.bridge);
+    const { answer, turn } = await collectBrowserResponse(req, res, req.app.locals.bridge);
     const translated = translatedOutput(answer, turn.tools);
 
     if (!stream) {
@@ -157,16 +157,9 @@ async function handleResponses(req, res) {
     }
 
     initResponsesSse(res);
-    writeSse(res, {
-      type: 'response.created',
-      response: {
-        id: responseId,
-        object: 'response',
-        status: 'in_progress',
-        model: turn.requestedModel || LOCAL_MODEL_ID,
-        output: [],
-      },
-    });
+    // Keep this minimal: Codex's eventsource client only needs the event type and
+    // response object here, and this exactly matches the proven Cyrus shim shape.
+    writeSse(res, { type: 'response.created', response: {} });
 
     if (translated.toolCall) {
       writeSse(res, {
