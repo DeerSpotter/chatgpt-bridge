@@ -1,15 +1,16 @@
 {
   "name": "chatgpt-browser-bridge-node",
   "version": "6.4.1",
-  "description": "Local HTTP/OpenAI-compatible bridge for a logged-in ChatGPT session using either a Chrome extension companion or a dedicated Playwright worker.",
+  "description": "Local HTTP/OpenAI-compatible bridge for a logged-in ChatGPT session using a Chrome extension companion, with an experimental Playwright worker path.",
   "type": "module",
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js --server",
     "dev": "node --watch src/index.js --server",
     "interact": "node src/index.js",
-    "codex:local": "node scripts/codex-playwright-local.js",
+    "codex:local": "node scripts/codex-local.js",
     "codex:extension": "node scripts/codex-local.js",
+    "codex:playwright": "node scripts/codex-playwright-local.js",
     "check": "node scripts/check-js.js && node scripts/check-package.js",
     "test": "node --test",
     "test:e2e": "node scripts/e2e-real.js",
