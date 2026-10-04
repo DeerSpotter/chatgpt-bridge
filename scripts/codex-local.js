@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -65,9 +66,72 @@ function startBridge() {
   return child;
 }
 
-function codexCommand() {
-  if (process.env.CODEX_BIN) return process.env.CODEX_BIN;
-  return process.platform === 'win32' ? 'codex.cmd' : 'codex';
+function existingFile(value) {
+  if (!value) return '';
+  try {
+    return fs.statSync(value).isFile() ? value : '';
+  } catch {
+    return '';
+  }
+}
+
+function npmCodexEntryNear(directory) {
+  if (!directory) return '';
+  const candidates = [
+    path.join(directory, 'node_modules', '@openai', 'codex', 'bin', 'codex.js'),
+    path.join(directory, 'node_modules', '@openai', 'codex', 'bin', 'codex.mjs'),
+  ];
+  return candidates.map(existingFile).find(Boolean) || '';
+}
+
+function resolveWindowsCodexLaunch() {
+  const explicit = String(process.env.CODEX_BIN || '').trim();
+  if (explicit) {
+    const absolute = path.isAbsolute(explicit) ? explicit : existingFile(path.resolve(explicit));
+    const resolved = absolute || existingFile(explicit);
+    const ext = path.extname(resolved || explicit).toLowerCase();
+    if (ext === '.js' || ext === '.mjs') {
+      return { command: process.execPath, argsPrefix: [resolved || explicit], label: resolved || explicit };
+    }
+    if (ext === '.cmd' || ext === '.bat') {
+      const entry = npmCodexEntryNear(path.dirname(resolved || explicit));
+      if (entry) return { command: process.execPath, argsPrefix: [entry], label: entry };
+      throw new Error(`CODEX_BIN points to ${ext} shim '${explicit}', but its npm Codex entrypoint was not found. Point CODEX_BIN at codex.exe or @openai/codex/bin/codex.js.`);
+    }
+    return { command: resolved || explicit, argsPrefix: [], label: resolved || explicit };
+  }
+
+  const pathDirs = String(process.env.PATH || '')
+    .split(path.delimiter)
+    .map((entry) => entry.replace(/^"|"$/g, '').trim())
+    .filter(Boolean);
+
+  for (const directory of pathDirs) {
+    const exe = existingFile(path.join(directory, 'codex.exe'));
+    if (exe) return { command: exe, argsPrefix: [], label: exe };
+  }
+
+  const npmRoots = [
+    ...pathDirs,
+    process.env.APPDATA ? path.join(process.env.APPDATA, 'npm') : '',
+  ].filter(Boolean);
+  for (const directory of [...new Set(npmRoots)]) {
+    const entry = npmCodexEntryNear(directory);
+    if (entry) return { command: process.execPath, argsPrefix: [entry], label: entry };
+  }
+
+  const cmdShim = pathDirs.map((directory) => existingFile(path.join(directory, 'codex.cmd'))).find(Boolean);
+  if (cmdShim) {
+    throw new Error(`Found Codex command shim at '${cmdShim}', but not a directly executable codex.exe or npm JS entrypoint. Set CODEX_BIN to the real codex.exe or @openai/codex/bin/codex.js path.`);
+  }
+
+  throw new Error('Codex executable was not found on PATH. Install Codex or set CODEX_BIN to codex.exe / @openai/codex/bin/codex.js.');
+}
+
+function resolveCodexLaunch() {
+  if (process.platform === 'win32') return resolveWindowsCodexLaunch();
+  const explicit = String(process.env.CODEX_BIN || '').trim();
+  return { command: explicit || 'codex', argsPrefix: [], label: explicit || 'codex' };
 }
 
 function localCodexHome() {
@@ -133,11 +197,16 @@ async function main() {
     env.CODEX_HOME = localCodexHome();
   }
 
-  const child = spawn(codexCommand(), buildCodexArgs(process.argv.slice(2)), {
+  const launch = resolveCodexLaunch();
+  const codexArgs = [...launch.argsPrefix, ...buildCodexArgs(process.argv.slice(2))];
+  console.log(`[local] Codex executable: ${launch.label}`);
+
+  const child = spawn(launch.command, codexArgs, {
     cwd: process.cwd(),
     env,
     stdio: 'inherit',
     windowsHide: false,
+    shell: false,
   });
 
   const exitCode = await new Promise((resolve) => {
