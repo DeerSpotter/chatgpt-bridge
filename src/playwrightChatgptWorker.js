@@ -1,0 +1,273 @@
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+const repoRoot = path.resolve(here, '..');
+const DEFAULT_PROFILE_DIR = path.join(os.homedir(), '.bridge-data', 'chatgpt-playwright-profile');
+const DEFAULT_BROWSER_DIR = path.join(repoRoot, '.bridge-data', 'playwright-browsers');
+const CHATGPT_URL = 'https://chatgpt.com/';
+const ASSISTANT_SELECTOR = '[data-message-author-role="assistant"]';
+const COMPOSER_SELECTORS = [
+  '#prompt-textarea',
+  '[data-testid="prompt-textarea"]',
+  'textarea[placeholder*="Message"]',
+  'div[contenteditable="true"][data-lexical-editor="true"]',
+];
+const SEND_SELECTORS = [
+  'button[data-testid="send-button"]',
+  'button[aria-label="Send prompt"]',
+  'button[aria-label*="Send"]',
+];
+const STOP_SELECTORS = [
+  'button[data-testid="stop-button"]',
+  'button[aria-label*="Stop"]',
+];
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function truthy(value) {
+  return ['1', 'true', 'yes', 'on'].includes(String(value || '').trim().toLowerCase());
+}
+
+function ensureDir(directory) {
+  fs.mkdirSync(directory, { recursive: true });
+  return directory;
+}
+
+function playwrightCliPath() {
+  const candidates = [
+    path.join(repoRoot, 'node_modules', 'playwright', 'cli.js'),
+    path.join(repoRoot, 'node_modules', 'playwright', 'lib', 'program.js'),
+  ];
+  return candidates.find((candidate) => fs.existsSync(candidate)) || '';
+}
+
+async function importPlaywright() {
+  try {
+    return await import('playwright');
+  } catch (error) {
+    const wrapped = new Error('Playwright is not installed. Run npm install once, or launch START-LOCAL-AGENT.cmd which installs missing dependencies automatically.');
+    wrapped.code = 'PLAYWRIGHT_NOT_INSTALLED';
+    wrapped.cause = error;
+    throw wrapped;
+  }
+}
+
+async function runPlaywrightInstall(browserDir) {
+  const cli = playwrightCliPath();
+  if (!cli) throw new Error('Playwright CLI was not found under node_modules. Run npm install first.');
+  console.log(`[playwright] installing Chromium into ${browserDir}`);
+  await new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [cli, 'install', 'chromium'], {
+      cwd: repoRoot,
+      env: { ...process.env, PLAYWRIGHT_BROWSERS_PATH: browserDir },
+      stdio: 'inherit',
+      shell: false,
+    });
+    child.on('error', reject);
+    child.on('exit', (code) => code === 0 ? resolve() : reject(new Error(`Playwright Chromium install exited with code ${code}`)));
+  });
+}
+
+async function firstVisible(page, selectors) {
+  for (const selector of selectors) {
+    const locator = page.locator(selector).first();
+    try {
+      if (await locator.isVisible({ timeout: 300 })) return locator;
+    } catch {}
+  }
+  return null;
+}
+
+async function composerReady(page, timeoutMs = 15_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await firstVisible(page, COMPOSER_SELECTORS)) return true;
+    await sleep(250);
+  }
+  return false;
+}
+
+export class PlaywrightChatgptWorker {
+  #playwright = null;
+  #context = null;
+  #page = null;
+  #queue = Promise.resolve();
+  #startedAt = 0;
+  #lastUsedAt = 0;
+  #authenticated = false;
+  #headless = true;
+  #installAttempted = false;
+
+  constructor(options = {}) {
+    this.profileDir = ensureDir(path.resolve(options.profileDir || process.env.CHATGPT_PLAYWRIGHT_PROFILE || DEFAULT_PROFILE_DIR));
+    this.browserDir = ensureDir(path.resolve(options.browserDir || process.env.PLAYWRIGHT_BROWSERS_PATH || DEFAULT_BROWSER_DIR));
+    this.forceHeaded = options.headless === false || truthy(process.env.CHATGPT_PLAYWRIGHT_HEADED);
+    this.loginTimeoutMs = Math.max(60_000, Number(options.loginTimeoutMs || process.env.CHATGPT_PLAYWRIGHT_LOGIN_TIMEOUT_MS) || 600_000);
+    this.responseTimeoutMs = Math.max(30_000, Number(options.responseTimeoutMs || process.env.CHATGPT_PLAYWRIGHT_RESPONSE_TIMEOUT_MS) || 600_000);
+  }
+
+  status() {
+    return {
+      mode: 'playwright-persistent-context',
+      running: Boolean(this.#context),
+      authenticated: this.#authenticated,
+      headless: this.#headless,
+      profileDir: this.profileDir,
+      browserDir: this.browserDir,
+      url: this.#page?.url?.() || '',
+      startedAt: this.#startedAt,
+      lastUsedAt: this.#lastUsedAt,
+    };
+  }
+
+  async #launch(headless) {
+    process.env.PLAYWRIGHT_BROWSERS_PATH = this.browserDir;
+    this.#playwright ||= await importPlaywright();
+    const { chromium } = this.#playwright;
+
+    const executablePath = chromium.executablePath();
+    if (!fs.existsSync(executablePath)) {
+      if (this.#installAttempted) throw new Error(`Playwright Chromium is still missing after installation attempt: ${executablePath}`);
+      this.#installAttempted = true;
+      await runPlaywrightInstall(this.browserDir);
+    }
+
+    this.#headless = headless;
+    this.#context = await chromium.launchPersistentContext(this.profileDir, {
+      headless,
+      viewport: { width: 1440, height: 1000 },
+      locale: 'en-US',
+      args: [
+        '--disable-background-timer-throttling',
+        '--disable-backgrounding-occluded-windows',
+        '--disable-renderer-backgrounding',
+      ],
+    });
+    const pages = this.#context.pages();
+    this.#page = pages[0] || await this.#context.newPage();
+    this.#startedAt ||= Date.now();
+    await this.#page.goto(CHATGPT_URL, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+  }
+
+  async #closeContext() {
+    const context = this.#context;
+    this.#context = null;
+    this.#page = null;
+    this.#authenticated = false;
+    if (context) await context.close().catch(() => {});
+  }
+
+  async start() {
+    if (this.#context && this.#page) return this.status();
+
+    await this.#launch(this.forceHeaded ? false : true);
+    if (await composerReady(this.#page, 20_000)) {
+      this.#authenticated = true;
+      return this.status();
+    }
+
+    if (this.#headless) {
+      console.log('[playwright] ChatGPT login is required. Opening the dedicated worker browser for one-time sign-in.');
+      await this.#closeContext();
+      await this.#launch(false);
+    } else {
+      console.log('[playwright] ChatGPT login is required in the worker browser.');
+    }
+
+    const loginDeadline = Date.now() + this.loginTimeoutMs;
+    while (Date.now() < loginDeadline) {
+      if (await composerReady(this.#page, 1_000)) {
+        this.#authenticated = true;
+        console.log('[playwright] ChatGPT worker profile is authenticated.');
+        break;
+      }
+      await sleep(500);
+    }
+    if (!this.#authenticated) throw new Error('Timed out waiting for ChatGPT login in the Playwright worker browser.');
+
+    if (!this.forceHeaded) {
+      console.log('[playwright] restarting the authenticated worker headless');
+      await this.#closeContext();
+      await this.#launch(true);
+      if (!await composerReady(this.#page, 20_000)) {
+        console.log('[playwright] headless ChatGPT startup did not expose the composer; falling back to headed worker mode.');
+        await this.#closeContext();
+        await this.#launch(false);
+      }
+      this.#authenticated = await composerReady(this.#page, 20_000);
+      if (!this.#authenticated) throw new Error('ChatGPT worker profile is logged in but the composer did not become ready.');
+    }
+
+    return this.status();
+  }
+
+  async newConversation() {
+    await this.start();
+    await this.#page.goto(CHATGPT_URL, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+    if (!await composerReady(this.#page, 20_000)) throw new Error('ChatGPT composer is unavailable in the Playwright worker.');
+  }
+
+  async #sendInternal(prompt) {
+    await this.start();
+    const page = this.#page;
+    const composer = await firstVisible(page, COMPOSER_SELECTORS);
+    if (!composer) {
+      this.#authenticated = false;
+      throw new Error('ChatGPT composer disappeared. The worker may need to log in again.');
+    }
+
+    const beforeCount = await page.locator(ASSISTANT_SELECTOR).count();
+    await composer.fill(String(prompt || ''));
+
+    const sendButton = await firstVisible(page, SEND_SELECTORS);
+    if (sendButton) await sendButton.click();
+    else await composer.press('Enter');
+
+    const deadline = Date.now() + this.responseTimeoutMs;
+    let lastText = '';
+    let stableSince = 0;
+    let seenAssistant = false;
+
+    while (Date.now() < deadline) {
+      const assistant = page.locator(ASSISTANT_SELECTOR);
+      const count = await assistant.count();
+      if (count > beforeCount) seenAssistant = true;
+
+      if (seenAssistant && count > 0) {
+        const text = String(await assistant.nth(count - 1).innerText().catch(() => '')).trim();
+        if (text && text === lastText) {
+          if (!stableSince) stableSince = Date.now();
+        } else {
+          lastText = text;
+          stableSince = text ? Date.now() : 0;
+        }
+
+        const stopButton = await firstVisible(page, STOP_SELECTORS);
+        if (lastText && !stopButton && stableSince && Date.now() - stableSince >= 1_500) {
+          this.#lastUsedAt = Date.now();
+          return lastText;
+        }
+      }
+
+      await sleep(350);
+    }
+
+    throw new Error(`Timed out waiting for ChatGPT response after ${this.responseTimeoutMs}ms`);
+  }
+
+  async send(prompt) {
+    const run = this.#queue.then(() => this.#sendInternal(prompt));
+    this.#queue = run.catch(() => {});
+    return await run;
+  }
+
+  async close() {
+    await this.#closeContext();
+  }
+}
