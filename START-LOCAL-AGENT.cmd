@@ -3,7 +3,10 @@ setlocal
 cd /d "%~dp0"
 title ChatGPT Local Codex Agent
 
-echo [local] ChatGPT Playwright + Codex launcher
+echo [local] ChatGPT web session + Codex local harness
+echo [local] One launcher: starts the local bridge if needed, then starts Codex.
+echo [local] Existing signed-in Chrome session is reused; no second ChatGPT login is required.
+echo.
 
 where node >nul 2>nul
 if errorlevel 1 (
@@ -12,17 +15,7 @@ if errorlevel 1 (
   exit /b 1
 )
 
-if not exist "node_modules\playwright\package.json" (
-  echo [local] Installing local Playwright runtime 1.63.0...
-  call npm install --no-save --package-lock=false playwright@1.63.0
-  if errorlevel 1 (
-    echo [local] ERROR: Playwright installation failed.
-    pause
-    exit /b 1
-  )
-)
-
-node scripts\codex-playwright-local.js %*
+node scripts\codex-local.js %*
 set "EXIT_CODE=%ERRORLEVEL%"
 
 if not "%EXIT_CODE%"=="0" (
