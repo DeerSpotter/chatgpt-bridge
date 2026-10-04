@@ -64,7 +64,27 @@ function unsupported(res, message) {
   });
 }
 
-async function collectBrowserResponse(req, res, bridge) {
+function connectedClientIds(health) {
+  return new Set((health?.clients || []).map((client) => String(client?.id || '')).filter(Boolean));
+}
+
+function refreshWorkerState(workerState, health, turn) {
+  if (!workerState?.clientId) return;
+  if (connectedClientIds(health).has(workerState.clientId)) return;
+
+  if (turn.kind === 'tool_result') {
+    const error = new Error('The dedicated ChatGPT worker tab was closed or disconnected during an active local tool loop. The bridge will not silently move this tool result to another conversation.');
+    error.statusCode = 409;
+    error.code = 'worker_context_lost';
+    throw error;
+  }
+
+  workerState.clientId = '';
+  workerState.sessionId = '';
+  workerState.startedAt = 0;
+}
+
+async function collectBrowserResponse(req, res, bridge, workerState) {
   const kind = requestKind(req);
   if (kind !== 'turn') {
     const error = new Error(`Background Codex request kind '${kind}' is disabled for the local ChatGPT web provider.`);
@@ -82,11 +102,21 @@ async function collectBrowserResponse(req, res, bridge) {
   }
 
   const turn = extractResponsesTurn(req.body || {});
+  refreshWorkerState(workerState, health, turn);
+
   const prompt = buildResponsesBridgePrompt(turn);
   if (!prompt) {
     const error = new Error('No user message or local tool result was found in the Responses request.');
     error.statusCode = 400;
     error.code = 'missing_input';
+    throw error;
+  }
+
+  const firstWorkerTurn = !workerState.clientId;
+  if (turn.kind === 'tool_result' && firstWorkerTurn) {
+    const error = new Error('A local tool result arrived without an established ChatGPT worker conversation. Refusing to attach it to an unrelated browser tab.');
+    error.statusCode = 409;
+    error.code = 'worker_context_missing';
     throw error;
   }
 
@@ -98,22 +128,38 @@ async function collectBrowserResponse(req, res, bridge) {
   res.on('close', onClose);
 
   try {
-    const response = await bridge.sendRequest(
-      {
-        message: prompt,
-        attachments: [],
-        // The browser tab is the authority for the actual ChatGPT model. Do not
-        // map the Codex metadata slug into a ChatGPT model selector here.
-        model: '',
-        effort: '',
-        sessionId: '',
-        newSession: false,
-        freshTab: false,
-      },
-      {},
-      { fullResponse: true, signal: abortController.signal },
-    );
+    const request = {
+      message: prompt,
+      attachments: [],
+      // The browser tab is the authority for the actual ChatGPT model. Do not
+      // map the Codex metadata slug into a ChatGPT model selector here.
+      model: '',
+      effort: '',
+      sessionId: '',
+      sourceClientId: firstWorkerTurn ? '' : workerState.clientId,
+      newSession: firstWorkerTurn,
+      freshTab: firstWorkerTurn,
+    };
+    const options = {
+      fullResponse: true,
+      signal: abortController.signal,
+      sourceClientId: firstWorkerTurn ? '' : workerState.clientId,
+      // Create the dedicated worker without stealing focus from the user's
+      // normal ChatGPT tab. Subsequent turns are pinned to its client id.
+      autoOpenTab: firstWorkerTurn,
+      autoOpenTabActive: false,
+    };
+
+    const response = await bridge.sendRequest(request, {}, options);
     complete = true;
+
+    const sourceClientId = String(response?.sourceClientId || '').trim();
+    if (sourceClientId) workerState.clientId = sourceClientId;
+    const sessionId = String(response?.session?.id || '').trim();
+    if (sessionId) workerState.sessionId = sessionId;
+    if (!workerState.startedAt) workerState.startedAt = Date.now();
+    workerState.lastUsedAt = Date.now();
+
     return { answer: outputText(response), response, turn };
   } finally {
     res.off('close', onClose);
@@ -143,12 +189,12 @@ function nonStreamingResponse(responseId, requestedModel, translated) {
   };
 }
 
-async function handleResponses(req, res) {
+async function handleResponses(req, res, workerState) {
   const responseId = `resp_local_${crypto.randomUUID().replaceAll('-', '')}`;
   const stream = req.body?.stream !== false;
 
   try {
-    const { answer, turn } = await collectBrowserResponse(req, res, req.app.locals.bridge);
+    const { answer, turn } = await collectBrowserResponse(req, res, req.app.locals.bridge, workerState);
     const translated = translatedOutput(answer, turn.tools);
 
     if (!stream) {
@@ -213,6 +259,13 @@ async function handleResponses(req, res) {
 
 export function createLocalResponsesProviderRouter(bridge) {
   const router = express.Router();
+  const workerState = {
+    clientId: '',
+    sessionId: '',
+    startedAt: 0,
+    lastUsedAt: 0,
+  };
+
   router.use((req, _res, next) => {
     req.app.locals.bridge = bridge;
     next();
@@ -222,6 +275,7 @@ export function createLocalResponsesProviderRouter(bridge) {
 
   router.get('/v1/local-provider/status', requireLocal, (_req, res) => {
     const health = bridge.health();
+    const workerConnected = Boolean(workerState.clientId && connectedClientIds(health).has(workerState.clientId));
     res.json({
       ok: health.ok,
       provider: 'chatgpt-browser-bridge',
@@ -235,6 +289,12 @@ export function createLocalResponsesProviderRouter(bridge) {
       browserConnected: health.ok,
       selectedClientId: health.selectedClientId || '',
       activeClient: health.activeClient || null,
+      workerMode: 'dedicated-background-tab',
+      workerConnected,
+      workerClientId: workerConnected ? workerState.clientId : '',
+      workerSessionId: workerConnected ? workerState.sessionId : '',
+      workerStartedAt: workerConnected ? workerState.startedAt : 0,
+      workerLastUsedAt: workerConnected ? workerState.lastUsedAt : 0,
     });
   });
 
@@ -250,8 +310,8 @@ export function createLocalResponsesProviderRouter(bridge) {
   router.get('/v1/models', requireLocal, models);
   router.post('/v1/models', requireLocal, models);
 
-  router.post('/v1/responses', requireLocal, handleResponses);
-  router.post('/responses', requireLocal, handleResponses);
+  router.post('/v1/responses', requireLocal, (req, res) => handleResponses(req, res, workerState));
+  router.post('/responses', requireLocal, (req, res) => handleResponses(req, res, workerState));
 
   router.post('/v1/responses/compact', requireLocal, (_req, res) => unsupported(
     res,
