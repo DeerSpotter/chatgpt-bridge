@@ -4,16 +4,18 @@
 
 This project exposes HTTP, OpenAI-compatible, RPC, workflow, and Terlio.js interfaces that drive a logged-in ChatGPT browser tab through a Chrome/Chromium extension.
 
-Current release contract:
+Candidate source versions for this checkout (not a deployment claim):
 
-- bridge package: `6.4.0`;
-- extension: `2.4.3`;
-- content runtime: `4.4.3`;
+- bridge package: `6.4.1`;
+- extension: `2.4.7`;
+- content runtime: `4.4.7`;
 - extension protocol: `5` only;
 - background runtime schema: `6` only;
 - WebSocket endpoint: `/extension/ws`.
 
 No polling, page-context WebSocket, userscript transport, protocol downgrade, alternate request lifecycle, job API, or alternate interactive runtime remains.
+
+These candidate versions describe source files in this checkout; they do not assert that the bundles have been deployed. The Bridge verifies extension compatibility and requests lease release when its request lifecycle is complete. The extension background alone proves physical cleanup and emits `lease.released` after that proof. If cleanup remains ambiguous, the background quarantines the tab and emits `lease.quarantined`; ambiguous cleanup never makes the prompt eligible for replay.
 
 ## Request and storage failure boundaries
 
@@ -46,7 +48,7 @@ The behavioral regressions are included in the full suite, release fault matrix,
 - Request recovery proves the exact submitted user boundary within one DOM sample, never chronology from indices across samples. Hidden historical copies are excluded.
 - Generated images use the explicit read-only `artifact.image.read` command during request leases; UI/action downloads retain the standalone write barrier.
 - Codex UI reconciliation orders recovered images by browser candidate order around exact file-identity anchors. Recovery time does not become message time, and unknown local ownership stays unknown; verified captures repair existing previews in place.
-- Extension 2.4.0 and content runtime 4.4.0 are required by the compatibility gate.
+- At the 2.4.0 release, extension 2.4.0 and content runtime 4.4.0 were the minimum versions required by the compatibility gate.
 
 ## 2.3.24 canonical workflow hard cut
 
@@ -54,6 +56,7 @@ The behavioral regressions are included in the full suite, release fault matrix,
 - Workflow configuration no longer infers presets or accepts renamed automation, watch, apply, session, restart, or repair fields.
 - Extension runtime storage reads only the V6 namespace, maintenance state no longer migrates Protocol 5 data, and effect planning requires the server-provided preconditions hash.
 - Plaintext page-storage tokens are discarded instead of migrated; secrets are written only through the extension-private storage path.
+- At the 2.3.24 release, extension 2.3.24 and content runtime 4.3.22 were the minimum versions required by the compatibility gate.
 
 ## 2.3.23 authenticated attachment transport
 
@@ -67,7 +70,6 @@ The behavioral regressions are included in the full suite, release fault matrix,
 - Continuous mutations cannot postpone an urgent read; changed DOM and observer shutdown invalidate in-flight snapshots.
 - Response selection stops at the next user turn. Prompt context requires an exact assistant key, and history virtualization updates indices without invalidating stable keys.
 - Final-answer extraction audits the whole message, including code and prose outside Markdown wrappers. Empty shells and pending/failed artifacts cannot complete a request.
-- Content runtime 4.3.22 and extension 2.3.24 are required by the compatibility gate.
 
 ## 2.3.19 generated-image diagnostic stability
 
@@ -101,7 +103,7 @@ runtime evidence, publication ordering, and retrieval-boundary coverage.
 - Chrome can clone `sessionStorage` when one ChatGPT tab opens another tab. The content-generated base ID is therefore diagnostic only; the extension background scopes the authoritative Protocol 5 source identity to the real Chrome `tabId`.
 - Reloading one tab preserves its tab-scoped identity, while two tabs that inherited the same base content ID remain distinct clients. The hub treats the Protocol 5 envelope source as authoritative and retains the base ID only as `contentClientId` diagnostics.
 - The interactive `/workflow` choice **Start a new chat** opens a dedicated Bridge-owned ChatGPT tab first. The initialization prompt targets that exact tab, and the workflow is pinned only after ChatGPT returns a concrete conversation ID.
-- The pseudo-session `new` is never selected through `session.apply` and is never persisted as a workflow binding. Bridge `6.3.13` requires extension `2.3.11` because earlier backgrounds could collapse cloned tabs into one reconnecting client.
+- The pseudo-session `new` is never selected through `session.apply` and is never persisted as a workflow binding. At that release, Bridge `6.3.13` required extension `2.3.11` because earlier backgrounds could collapse cloned tabs into one reconnecting client.
 - Local parity deliberately gives every mock tab the same cloned base content ID. Production background, hub, bootstrap-helper, and full interactive wizard tests must still keep the tabs separate and bind the workflow to the newly opened tab.
 
 ## 6.3.12 successful-run mock parity
