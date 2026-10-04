@@ -17,7 +17,7 @@ import {
 } from '../src/responsesPayload.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const repoRoot = path.resolve(here, '..');
+path.resolve(here, '..');
 const bridgeHome = path.resolve(process.env.CHATGPT_BRIDGE_HOME || path.join(os.homedir(), '.bridge-data'));
 const providerCheckout = path.resolve(process.env.CHATGPT_WEB_PROVIDER_CHECKOUT || path.join(bridgeHome, 'vendor', 'chatgpt-web-provider'));
 const providerHome = path.resolve(process.env.CHATGPT_WEB_PROVIDER_HOME || path.join(bridgeHome, 'chatgpt-web-provider'));
@@ -227,7 +227,8 @@ function providerEnv() {
 }
 
 async function ensureProviderDependencies(bun) {
-  const marker = path.join(providerCheckout, `.bridge-deps-${providerCommit}.ok`);
+  const markerDir = ensureDir(path.join(providerHome, 'markers'));
+  const marker = path.join(markerDir, `deps-${providerCommit}.ok`);
   if (existingFile(marker)) return;
   console.log('[bootstrap] installing chatgpt-web-provider dependencies');
   await spawnInherited(bun, ['install', '--frozen-lockfile'], { cwd: providerCheckout, env: providerEnv() });
@@ -266,9 +267,11 @@ async function ensureProviderLogin(bun) {
   const doctor = await runProviderCli(bun, ['doctor']);
   if (doctor.code === 0) return;
 
-  const profile = String(process.env.CHATGPT_WEB_PROVIDER_IMPORT_PROFILE || '').trim();
+  const requestedProfile = String(process.env.CHATGPT_WEB_PROVIDER_IMPORT_PROFILE || 'Default').trim();
+  const profile = requestedProfile.toLowerCase() === 'none' ? '' : requestedProfile;
   if (profile) {
     console.log(`[bootstrap] trying existing Chrome profile import: ${profile}`);
+    console.log('[bootstrap] If Chrome currently has that profile open, the import may fail safely and the launcher will fall back to the provider login flow.');
     const imported = await runProviderCli(bun, ['import-chrome', '--profile', profile]);
     if (imported.code === 0) {
       console.log('[bootstrap] existing Chrome ChatGPT login imported and verified');
@@ -339,6 +342,7 @@ async function askProvider(config, prompt) {
       stream: false,
       messages: [{ role: 'user', content: prompt }],
     }),
+    signal: AbortSignal.timeout(Math.max(30_000, Number(process.env.CHATGPT_WEB_PROVIDER_TURN_TIMEOUT_MS) || 600_000)),
   });
   const raw = await response.text();
   let body = null;
@@ -590,6 +594,7 @@ async function stopOwnedChild(child, label) {
     const taskkill = await commandPath('taskkill.exe');
     if (taskkill) {
       await spawnCapture(taskkill, ['/PID', String(child.pid), '/T', '/F']).catch(() => {});
+      console.log(`[local] stopped owned ${label}`);
       return;
     }
   }
