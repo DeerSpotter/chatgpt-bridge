@@ -35,19 +35,21 @@ test('extractResponsesTurn keeps Codex context separate from the real user task'
   assert.match(turn.userInstructions, /keep changes small/);
 });
 
-test('latest tool result becomes the next ChatGPT web turn', () => {
+test('latest tool result becomes the next ChatGPT web turn and keeps tool identity', () => {
   const turn = extractResponsesTurn({
-    tools: [{ type: 'function', name: 'exec_command' }],
+    tools: [{ type: 'function', name: 'write_stdin' }],
     input: [
       { type: 'message', role: 'user', content: 'inspect the repo' },
-      { type: 'function_call', name: 'exec_command', call_id: 'call_1', arguments: '{"cmd":"git status"}' },
-      { type: 'function_call_output', call_id: 'call_1', output: 'On branch main\nnothing to commit' },
+      { type: 'function_call', name: 'write_stdin', call_id: 'call_1', arguments: '{"session_id":42}' },
+      { type: 'function_call_output', call_id: 'call_1', output: 'process finished' },
     ],
   });
 
   assert.equal(turn.kind, 'tool_result');
-  assert.match(turn.toolOutput, /nothing to commit/);
-  assert.match(buildResponsesBridgePrompt(turn), /LOCAL TOOL RESULT/);
+  assert.equal(turn.toolName, 'write_stdin');
+  assert.equal(turn.toolCallId, 'call_1');
+  assert.match(turn.toolOutput, /process finished/);
+  assert.match(buildResponsesBridgePrompt(turn), /LOCAL TOOL RESULT from write_stdin/);
 });
 
 test('run fence maps to current Codex exec_command arguments', () => {
@@ -70,6 +72,77 @@ test('patch fence maps to the freeform apply_patch tool', () => {
   assert.equal(call.type, 'custom_tool_call');
   assert.equal(call.name, 'apply_patch');
   assert.match(call.input, /Begin Patch/);
+});
+
+test('generic function fence passes advertised write_stdin arguments through unchanged', () => {
+  const tools = [{
+    type: 'function',
+    name: 'write_stdin',
+    description: 'Write to an existing exec session',
+    parameters: {
+      type: 'object',
+      properties: {
+        session_id: { type: 'number' },
+        chars: { type: 'string' },
+      },
+      required: ['session_id'],
+    },
+  }];
+
+  const call = parseResponsesToolCall(
+    '```tool\n{"name":"write_stdin","arguments":{"session_id":42,"chars":"y\\n"}}\n```',
+    tools,
+  );
+
+  assert.equal(call.type, 'function_call');
+  assert.equal(call.name, 'write_stdin');
+  assert.deepEqual(JSON.parse(call.arguments), { session_id: 42, chars: 'y\n' });
+});
+
+test('generic function fence rejects a tool Codex did not advertise', () => {
+  const call = parseResponsesToolCall(
+    '```tool\n{"name":"dangerous_made_up_tool","arguments":{"x":1}}\n```',
+    [{ type: 'function', name: 'exec_command' }],
+  );
+
+  assert.equal(call, null);
+});
+
+test('generic custom tool fence passes freeform input only for advertised custom tools', () => {
+  const call = parseResponsesToolCall(
+    '```custom_tool\n{"name":"apply_patch","input":"*** Begin Patch\\n*** End Patch"}\n```',
+    [{ type: 'custom', name: 'apply_patch' }],
+  );
+
+  assert.equal(call.type, 'custom_tool_call');
+  assert.equal(call.name, 'apply_patch');
+  assert.match(call.input, /Begin Patch/);
+});
+
+test('bridge prompt includes live advertised function schema', () => {
+  const prompt = buildResponsesBridgePrompt({
+    kind: 'user',
+    message: 'continue the process',
+    toolOutput: '',
+    toolName: '',
+    toolCallId: '',
+    environmentContext: '',
+    userInstructions: '',
+    tools: [{
+      type: 'function',
+      name: 'write_stdin',
+      description: 'Write to stdin',
+      parameters: {
+        type: 'object',
+        properties: { session_id: { type: 'number' } },
+        required: ['session_id'],
+      },
+    }],
+  });
+
+  assert.match(prompt, /ADVERTISED CODEX TOOLS/);
+  assert.match(prompt, /write_stdin/);
+  assert.match(prompt, /session_id/);
 });
 
 test('normal answer does not become a tool call', () => {
