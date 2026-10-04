@@ -1,21 +1,21 @@
 @echo off
 setlocal
 cd /d "%~dp0"
-title ChatGPT Local Codex Agent
+title ChatGPT Web Codex Agent
 
-echo [local] ChatGPT web session + Codex local harness
-echo [local] One launcher: starts the local bridge if needed, then starts Codex.
-echo [local] Existing signed-in Chrome session is reused; no second ChatGPT login is required.
+echo [local] ChatGPT web model + Codex local tool harness
+echo [local] One launcher owns the web provider, local adapter, and Codex lifecycle.
+echo [local] First run bootstraps a pinned portable Bun runtime and chatgpt-web-provider.
 echo.
 
 where node >nul 2>nul
 if errorlevel 1 (
-  echo [local] ERROR: Node.js was not found on PATH.
+  echo [local] ERROR: Node.js 20+ was not found on PATH.
   pause
   exit /b 1
 )
 
-node scripts\codex-local.js %*
+node scripts\codex-web-provider-local.js %*
 set "EXIT_CODE=%ERRORLEVEL%"
 
 if not "%EXIT_CODE%"=="0" (
