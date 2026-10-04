@@ -1,13 +1,8 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
 
-const here = path.dirname(fileURLToPath(import.meta.url));
-const repoRoot = path.resolve(here, '..');
 const DEFAULT_PROFILE_DIR = path.join(os.homedir(), '.bridge-data', 'chatgpt-playwright-profile');
-const DEFAULT_BROWSER_DIR = path.join(repoRoot, '.bridge-data', 'playwright-browsers');
 const CHATGPT_URL = 'https://chatgpt.com/';
 const ASSISTANT_SELECTOR = '[data-message-author-role="assistant"]';
 const COMPOSER_SELECTORS = [
@@ -39,124 +34,15 @@ function ensureDir(directory) {
   return directory;
 }
 
-function existingFile(value) {
-  if (!value) return '';
-  try {
-    return fs.statSync(value).isFile() ? value : '';
-  } catch {
-    return '';
-  }
-}
-
-function systemLoginBrowser() {
-  const explicit = existingFile(String(process.env.CHATGPT_LOGIN_BROWSER || '').trim());
-  if (explicit) return explicit;
-
-  if (process.platform === 'win32') {
-    const candidates = [
-      process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Google', 'Chrome', 'Application', 'chrome.exe') : '',
-      process.env.PROGRAMFILES ? path.join(process.env.PROGRAMFILES, 'Google', 'Chrome', 'Application', 'chrome.exe') : '',
-      process.env['PROGRAMFILES(X86)'] ? path.join(process.env['PROGRAMFILES(X86)'], 'Google', 'Chrome', 'Application', 'chrome.exe') : '',
-      process.env.PROGRAMFILES ? path.join(process.env.PROGRAMFILES, 'Microsoft', 'Edge', 'Application', 'msedge.exe') : '',
-      process.env['PROGRAMFILES(X86)'] ? path.join(process.env['PROGRAMFILES(X86)'], 'Microsoft', 'Edge', 'Application', 'msedge.exe') : '',
-    ];
-    return candidates.map(existingFile).find(Boolean) || '';
-  }
-
-  if (process.platform === 'darwin') {
-    return [
-      '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-      '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
-      '/Applications/Chromium.app/Contents/MacOS/Chromium',
-    ].map(existingFile).find(Boolean) || '';
-  }
-
-  return [
-    '/usr/bin/google-chrome',
-    '/usr/bin/google-chrome-stable',
-    '/usr/bin/microsoft-edge',
-    '/usr/bin/microsoft-edge-stable',
-    '/usr/bin/chromium',
-    '/usr/bin/chromium-browser',
-  ].map(existingFile).find(Boolean) || '';
-}
-
-async function bootstrapLoginWithSystemBrowser(profileDir) {
-  const browser = systemLoginBrowser();
-  if (!browser) {
-    throw new Error([
-      'ChatGPT authentication is required, but no normal Chrome/Edge browser was found for the one-time login bootstrap.',
-      'Install Chrome/Edge or set CHATGPT_LOGIN_BROWSER to the full path of a supported browser executable.',
-    ].join(' '));
-  }
-
-  console.log(`[login] opening normal browser for one-time ChatGPT authentication: ${browser}`);
-  console.log('[login] Sign into ChatGPT in that dedicated window, confirm the normal ChatGPT composer is visible, then CLOSE THE ENTIRE DEDICATED BROWSER WINDOW.');
-  console.log('[login] Google sign-in happens in the normal browser without Playwright controlling the page.');
-
-  const args = [
-    `--user-data-dir=${profileDir}`,
-    '--profile-directory=Default',
-    '--no-first-run',
-    '--no-default-browser-check',
-    '--new-window',
-    CHATGPT_URL,
-  ];
-
-  await new Promise((resolve, reject) => {
-    const child = spawn(browser, args, {
-      stdio: 'ignore',
-      shell: false,
-      windowsHide: false,
-    });
-    child.once('error', reject);
-    child.once('exit', (code, signal) => {
-      if (signal) {
-        reject(new Error(`The login browser exited via signal ${signal}`));
-        return;
-      }
-      if (Number.isInteger(code) && code !== 0) {
-        reject(new Error(`The login browser exited with code ${code}`));
-        return;
-      }
-      resolve();
-    });
-  });
-}
-
-function playwrightCliPath() {
-  const candidates = [
-    path.join(repoRoot, 'node_modules', 'playwright', 'cli.js'),
-    path.join(repoRoot, 'node_modules', 'playwright', 'lib', 'program.js'),
-  ];
-  return candidates.find((candidate) => fs.existsSync(candidate)) || '';
-}
-
 async function importPlaywright() {
   try {
     return await import('playwright');
   } catch (error) {
-    const wrapped = new Error('Playwright is not installed. Run npm install once, or launch START-LOCAL-AGENT.cmd which installs missing dependencies automatically.');
+    const wrapped = new Error('Playwright is not installed. Launch START-LOCAL-AGENT.cmd once so it can install the local Playwright runtime.');
     wrapped.code = 'PLAYWRIGHT_NOT_INSTALLED';
     wrapped.cause = error;
     throw wrapped;
   }
-}
-
-async function runPlaywrightInstall(browserDir) {
-  const cli = playwrightCliPath();
-  if (!cli) throw new Error('Playwright CLI was not found under node_modules. Run npm install first.');
-  console.log(`[playwright] installing Chromium into ${browserDir}`);
-  await new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [cli, 'install', 'chromium'], {
-      cwd: repoRoot,
-      env: { ...process.env, PLAYWRIGHT_BROWSERS_PATH: browserDir },
-      stdio: 'inherit',
-      shell: false,
-    });
-    child.on('error', reject);
-    child.on('exit', (code) => code === 0 ? resolve() : reject(new Error(`Playwright Chromium install exited with code ${code}`)));
-  });
 }
 
 async function firstVisible(page, selectors) {
@@ -173,7 +59,10 @@ async function sessionAuthenticated(page) {
   try {
     return await page.evaluate(async () => {
       try {
-        const response = await fetch('/api/auth/session', { credentials: 'include', cache: 'no-store' });
+        const response = await fetch('/api/auth/session', {
+          credentials: 'include',
+          cache: 'no-store',
+        });
         if (!response.ok) return false;
         const session = await response.json();
         return Boolean(session?.user && (session.user.id || session.user.email || session.user.name));
@@ -199,6 +88,23 @@ async function workerReady(page, timeoutMs = 15_000) {
   return false;
 }
 
+async function minimizePageWindow(context, page) {
+  try {
+    const cdp = await context.newCDPSession(page);
+    const target = await cdp.send('Browser.getWindowForTarget');
+    if (Number.isInteger(target?.windowId)) {
+      await cdp.send('Browser.setWindowBounds', {
+        windowId: target.windowId,
+        bounds: { windowState: 'minimized' },
+      });
+    }
+    await cdp.detach();
+  } catch {
+    // Minimize is cosmetic. Browser automation still works if the platform
+    // rejects the window-state command.
+  }
+}
+
 export class PlaywrightChatgptWorker {
   #playwright = null;
   #context = null;
@@ -207,58 +113,86 @@ export class PlaywrightChatgptWorker {
   #startedAt = 0;
   #lastUsedAt = 0;
   #authenticated = false;
-  #headless = true;
-  #installAttempted = false;
+  #minimized = false;
 
   constructor(options = {}) {
-    this.profileDir = ensureDir(path.resolve(options.profileDir || process.env.CHATGPT_PLAYWRIGHT_PROFILE || DEFAULT_PROFILE_DIR));
-    this.browserDir = ensureDir(path.resolve(options.browserDir || process.env.PLAYWRIGHT_BROWSERS_PATH || DEFAULT_BROWSER_DIR));
-    this.forceHeaded = options.headless === false || truthy(process.env.CHATGPT_PLAYWRIGHT_HEADED);
-    this.loginTimeoutMs = Math.max(60_000, Number(options.loginTimeoutMs || process.env.CHATGPT_PLAYWRIGHT_LOGIN_TIMEOUT_MS) || 600_000);
-    this.responseTimeoutMs = Math.max(30_000, Number(options.responseTimeoutMs || process.env.CHATGPT_PLAYWRIGHT_RESPONSE_TIMEOUT_MS) || 600_000);
+    this.profileDir = ensureDir(path.resolve(
+      options.profileDir || process.env.CHATGPT_PLAYWRIGHT_PROFILE || DEFAULT_PROFILE_DIR,
+    ));
+    this.channel = String(
+      options.channel || process.env.CHATGPT_PLAYWRIGHT_CHANNEL || 'chrome',
+    ).trim() || 'chrome';
+    this.forceVisible = options.minimized === false
+      || truthy(process.env.CHATGPT_PLAYWRIGHT_VISIBLE)
+      || truthy(process.env.CHATGPT_PLAYWRIGHT_HEADED);
+    this.loginTimeoutMs = Math.max(
+      60_000,
+      Number(options.loginTimeoutMs || process.env.CHATGPT_PLAYWRIGHT_LOGIN_TIMEOUT_MS) || 600_000,
+    );
+    this.responseTimeoutMs = Math.max(
+      30_000,
+      Number(options.responseTimeoutMs || process.env.CHATGPT_PLAYWRIGHT_RESPONSE_TIMEOUT_MS) || 600_000,
+    );
   }
 
   status() {
     return {
-      mode: 'playwright-persistent-context',
+      mode: 'playwright-installed-browser-persistent-context',
       running: Boolean(this.#context),
       authenticated: this.#authenticated,
-      headless: this.#headless,
+      channel: this.channel,
+      minimized: this.#minimized,
       profileDir: this.profileDir,
-      browserDir: this.browserDir,
       url: this.#page?.url?.() || '',
       startedAt: this.#startedAt,
       lastUsedAt: this.#lastUsedAt,
     };
   }
 
-  async #launch(headless) {
-    process.env.PLAYWRIGHT_BROWSERS_PATH = this.browserDir;
+  async #launch({ minimized = false } = {}) {
     this.#playwright ||= await importPlaywright();
     const { chromium } = this.#playwright;
 
-    const executablePath = chromium.executablePath();
-    if (!fs.existsSync(executablePath)) {
-      if (this.#installAttempted) throw new Error(`Playwright Chromium is still missing after installation attempt: ${executablePath}`);
-      this.#installAttempted = true;
-      await runPlaywrightInstall(this.browserDir);
+    this.#minimized = false;
+    try {
+      this.#context = await chromium.launchPersistentContext(this.profileDir, {
+        channel: this.channel,
+        headless: false,
+        viewport: { width: 1440, height: 1000 },
+        locale: 'en-US',
+        args: [
+          '--no-first-run',
+          '--no-default-browser-check',
+          '--disable-background-timer-throttling',
+          '--disable-backgrounding-occluded-windows',
+          '--disable-renderer-backgrounding',
+        ],
+      });
+    } catch (error) {
+      const wrapped = new Error([
+        `Unable to launch Playwright with installed browser channel '${this.channel}'.`,
+        this.channel === 'chrome'
+          ? 'Google Chrome must be installed. If needed, set CHATGPT_PLAYWRIGHT_CHANNEL=msedge to use Microsoft Edge.'
+          : 'Set CHATGPT_PLAYWRIGHT_CHANNEL=chrome or msedge to an installed browser channel.',
+        `Original error: ${error?.message || error}`,
+      ].join(' '));
+      wrapped.code = 'PLAYWRIGHT_BROWSER_CHANNEL_FAILED';
+      wrapped.cause = error;
+      throw wrapped;
     }
 
-    this.#headless = headless;
-    this.#context = await chromium.launchPersistentContext(this.profileDir, {
-      headless,
-      viewport: { width: 1440, height: 1000 },
-      locale: 'en-US',
-      args: [
-        '--disable-background-timer-throttling',
-        '--disable-backgrounding-occluded-windows',
-        '--disable-renderer-backgrounding',
-      ],
-    });
     const pages = this.#context.pages();
     this.#page = pages[0] || await this.#context.newPage();
     this.#startedAt ||= Date.now();
-    await this.#page.goto(CHATGPT_URL, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+    await this.#page.goto(CHATGPT_URL, {
+      waitUntil: 'domcontentloaded',
+      timeout: 60_000,
+    });
+
+    if (minimized && !this.forceVisible) {
+      await minimizePageWindow(this.#context, this.#page);
+      this.#minimized = true;
+    }
   }
 
   async #closeContext() {
@@ -266,64 +200,72 @@ export class PlaywrightChatgptWorker {
     this.#context = null;
     this.#page = null;
     this.#authenticated = false;
+    this.#minimized = false;
     if (context) await context.close().catch(() => {});
   }
 
-  async #launchAuthenticatedWorker() {
-    await this.#launch(this.forceHeaded ? false : true);
+  async #launchSavedProfile() {
+    await this.#launch({ minimized: !this.forceVisible });
     if (await workerReady(this.#page, 20_000)) {
       this.#authenticated = true;
       return true;
     }
-
-    if (this.#headless && !this.forceHeaded) {
-      console.log('[playwright] authenticated profile did not become ready headless; retrying in headed worker mode.');
-      await this.#closeContext();
-      await this.#launch(false);
-      if (await workerReady(this.#page, 20_000)) {
-        this.#authenticated = true;
-        return true;
-      }
-    }
-
     return false;
   }
 
   async start() {
     if (this.#context && this.#page && this.#authenticated) return this.status();
 
-    if (await this.#launchAuthenticatedWorker()) return this.status();
+    if (await this.#launchSavedProfile()) return this.status();
 
-    console.log('[playwright] authenticated ChatGPT session is not present in the dedicated worker profile.');
     await this.#closeContext();
+    console.log(`[playwright] ChatGPT login is required in installed ${this.channel}.`);
+    console.log('[playwright] A dedicated browser profile will open visibly for one-time sign-in.');
+    console.log('[playwright] Complete any Google/OpenAI verification normally. The browser is real installed Chrome/Edge, not Playwright Chromium.');
 
-    // Do not perform Google/OAuth sign-in through an automation-controlled page.
-    // Seed the dedicated profile with a normal browser first, then hand the
-    // authenticated profile back to Playwright for subsequent automation.
-    await bootstrapLoginWithSystemBrowser(this.profileDir);
-
-    console.log('[playwright] normal-browser login window closed; validating the saved ChatGPT session.');
-    if (!await this.#launchAuthenticatedWorker()) {
-      await this.#closeContext();
-      throw new Error([
-        'The dedicated browser profile is still not authenticated with ChatGPT.',
-        'Run the launcher again, sign into ChatGPT in the normal Chrome/Edge window, wait until the ChatGPT composer is visible, then close the entire dedicated window.',
-      ].join(' '));
+    await this.#launch({ minimized: false });
+    const loginDeadline = Date.now() + this.loginTimeoutMs;
+    while (Date.now() < loginDeadline) {
+      if (await workerReady(this.#page, 1_500)) {
+        this.#authenticated = true;
+        console.log('[playwright] ChatGPT worker profile is authenticated.');
+        break;
+      }
+      await sleep(500);
     }
 
-    console.log('[playwright] ChatGPT worker profile is authenticated and ready.');
+    if (!this.#authenticated) {
+      await this.#closeContext();
+      throw new Error(`Timed out waiting for authenticated ChatGPT login in installed ${this.channel}.`);
+    }
+
+    if (!this.forceVisible) {
+      await minimizePageWindow(this.#context, this.#page);
+      this.#minimized = true;
+    }
+
     return this.status();
   }
 
   async newConversation() {
     await this.start();
-    await this.#page.goto(CHATGPT_URL, { waitUntil: 'domcontentloaded', timeout: 60_000 });
-    if (!await workerReady(this.#page, 20_000)) throw new Error('Authenticated ChatGPT composer is unavailable in the Playwright worker.');
+    await this.#page.goto(CHATGPT_URL, {
+      waitUntil: 'domcontentloaded',
+      timeout: 60_000,
+    });
+    if (!await workerReady(this.#page, 20_000)) {
+      throw new Error('Authenticated ChatGPT composer is unavailable in the Playwright worker.');
+    }
+    if (!this.forceVisible && !this.#minimized) {
+      await minimizePageWindow(this.#context, this.#page);
+      this.#minimized = true;
+    }
   }
 
   async #sendInternal(prompt) {
     await this.start();
     const page = this.#page;
+
     if (!await sessionAuthenticated(page)) {
       this.#authenticated = false;
       throw new Error('ChatGPT worker session is no longer authenticated. Restart the launcher to sign in again.');
