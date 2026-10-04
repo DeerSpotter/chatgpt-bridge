@@ -39,6 +39,91 @@ function ensureDir(directory) {
   return directory;
 }
 
+function existingFile(value) {
+  if (!value) return '';
+  try {
+    return fs.statSync(value).isFile() ? value : '';
+  } catch {
+    return '';
+  }
+}
+
+function systemLoginBrowser() {
+  const explicit = existingFile(String(process.env.CHATGPT_LOGIN_BROWSER || '').trim());
+  if (explicit) return explicit;
+
+  if (process.platform === 'win32') {
+    const candidates = [
+      process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Google', 'Chrome', 'Application', 'chrome.exe') : '',
+      process.env.PROGRAMFILES ? path.join(process.env.PROGRAMFILES, 'Google', 'Chrome', 'Application', 'chrome.exe') : '',
+      process.env['PROGRAMFILES(X86)'] ? path.join(process.env['PROGRAMFILES(X86)'], 'Google', 'Chrome', 'Application', 'chrome.exe') : '',
+      process.env.PROGRAMFILES ? path.join(process.env.PROGRAMFILES, 'Microsoft', 'Edge', 'Application', 'msedge.exe') : '',
+      process.env['PROGRAMFILES(X86)'] ? path.join(process.env['PROGRAMFILES(X86)'], 'Microsoft', 'Edge', 'Application', 'msedge.exe') : '',
+    ];
+    return candidates.map(existingFile).find(Boolean) || '';
+  }
+
+  if (process.platform === 'darwin') {
+    return [
+      '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+      '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+      '/Applications/Chromium.app/Contents/MacOS/Chromium',
+    ].map(existingFile).find(Boolean) || '';
+  }
+
+  return [
+    '/usr/bin/google-chrome',
+    '/usr/bin/google-chrome-stable',
+    '/usr/bin/microsoft-edge',
+    '/usr/bin/microsoft-edge-stable',
+    '/usr/bin/chromium',
+    '/usr/bin/chromium-browser',
+  ].map(existingFile).find(Boolean) || '';
+}
+
+async function bootstrapLoginWithSystemBrowser(profileDir) {
+  const browser = systemLoginBrowser();
+  if (!browser) {
+    throw new Error([
+      'ChatGPT authentication is required, but no normal Chrome/Edge browser was found for the one-time login bootstrap.',
+      'Install Chrome/Edge or set CHATGPT_LOGIN_BROWSER to the full path of a supported browser executable.',
+    ].join(' '));
+  }
+
+  console.log(`[login] opening normal browser for one-time ChatGPT authentication: ${browser}`);
+  console.log('[login] Sign into ChatGPT in that dedicated window, confirm the normal ChatGPT composer is visible, then CLOSE THE ENTIRE DEDICATED BROWSER WINDOW.');
+  console.log('[login] Google sign-in happens in the normal browser without Playwright controlling the page.');
+
+  const args = [
+    `--user-data-dir=${profileDir}`,
+    '--profile-directory=Default',
+    '--no-first-run',
+    '--no-default-browser-check',
+    '--new-window',
+    CHATGPT_URL,
+  ];
+
+  await new Promise((resolve, reject) => {
+    const child = spawn(browser, args, {
+      stdio: 'ignore',
+      shell: false,
+      windowsHide: false,
+    });
+    child.once('error', reject);
+    child.once('exit', (code, signal) => {
+      if (signal) {
+        reject(new Error(`The login browser exited via signal ${signal}`));
+        return;
+      }
+      if (Number.isInteger(code) && code !== 0) {
+        reject(new Error(`The login browser exited with code ${code}`));
+        return;
+      }
+      resolve();
+    });
+  });
+}
+
 function playwrightCliPath() {
   const candidates = [
     path.join(repoRoot, 'node_modules', 'playwright', 'cli.js'),
@@ -184,47 +269,49 @@ export class PlaywrightChatgptWorker {
     if (context) await context.close().catch(() => {});
   }
 
-  async start() {
-    if (this.#context && this.#page && this.#authenticated) return this.status();
-
+  async #launchAuthenticatedWorker() {
     await this.#launch(this.forceHeaded ? false : true);
     if (await workerReady(this.#page, 20_000)) {
       this.#authenticated = true;
-      return this.status();
+      return true;
     }
 
-    if (this.#headless) {
-      console.log('[playwright] Authenticated ChatGPT login is required. Opening the dedicated worker browser for one-time sign-in.');
+    if (this.#headless && !this.forceHeaded) {
+      console.log('[playwright] authenticated profile did not become ready headless; retrying in headed worker mode.');
       await this.#closeContext();
       await this.#launch(false);
-    } else {
-      console.log('[playwright] Sign into ChatGPT in the dedicated worker browser.');
-    }
-
-    const loginDeadline = Date.now() + this.loginTimeoutMs;
-    while (Date.now() < loginDeadline) {
-      if (await workerReady(this.#page, 1_500)) {
+      if (await workerReady(this.#page, 20_000)) {
         this.#authenticated = true;
-        console.log('[playwright] ChatGPT worker profile is authenticated.');
-        break;
+        return true;
       }
-      await sleep(500);
     }
-    if (!this.#authenticated) throw new Error('Timed out waiting for authenticated ChatGPT login in the Playwright worker browser.');
 
-    if (!this.forceHeaded) {
-      console.log('[playwright] restarting the authenticated worker headless');
+    return false;
+  }
+
+  async start() {
+    if (this.#context && this.#page && this.#authenticated) return this.status();
+
+    if (await this.#launchAuthenticatedWorker()) return this.status();
+
+    console.log('[playwright] authenticated ChatGPT session is not present in the dedicated worker profile.');
+    await this.#closeContext();
+
+    // Do not perform Google/OAuth sign-in through an automation-controlled page.
+    // Seed the dedicated profile with a normal browser first, then hand the
+    // authenticated profile back to Playwright for subsequent automation.
+    await bootstrapLoginWithSystemBrowser(this.profileDir);
+
+    console.log('[playwright] normal-browser login window closed; validating the saved ChatGPT session.');
+    if (!await this.#launchAuthenticatedWorker()) {
       await this.#closeContext();
-      await this.#launch(true);
-      if (!await workerReady(this.#page, 20_000)) {
-        console.log('[playwright] headless ChatGPT startup did not become ready; falling back to headed worker mode.');
-        await this.#closeContext();
-        await this.#launch(false);
-      }
-      this.#authenticated = await workerReady(this.#page, 20_000);
-      if (!this.#authenticated) throw new Error('ChatGPT worker profile is logged in but the authenticated composer did not become ready.');
+      throw new Error([
+        'The dedicated browser profile is still not authenticated with ChatGPT.',
+        'Run the launcher again, sign into ChatGPT in the normal Chrome/Edge window, wait until the ChatGPT composer is visible, then close the entire dedicated window.',
+      ].join(' '));
     }
 
+    console.log('[playwright] ChatGPT worker profile is authenticated and ready.');
     return this.status();
   }
 
