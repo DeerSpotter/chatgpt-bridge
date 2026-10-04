@@ -84,11 +84,32 @@ async function firstVisible(page, selectors) {
   return null;
 }
 
-async function composerReady(page, timeoutMs = 15_000) {
+async function sessionAuthenticated(page) {
+  try {
+    return await page.evaluate(async () => {
+      try {
+        const response = await fetch('/api/auth/session', { credentials: 'include', cache: 'no-store' });
+        if (!response.ok) return false;
+        const session = await response.json();
+        return Boolean(session?.user && (session.user.id || session.user.email || session.user.name));
+      } catch {
+        return false;
+      }
+    });
+  } catch {
+    return false;
+  }
+}
+
+async function workerReady(page, timeoutMs = 15_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (await firstVisible(page, COMPOSER_SELECTORS)) return true;
-    await sleep(250);
+    const [composer, authenticated] = await Promise.all([
+      firstVisible(page, COMPOSER_SELECTORS),
+      sessionAuthenticated(page),
+    ]);
+    if (composer && authenticated) return true;
+    await sleep(350);
   }
   return false;
 }
@@ -164,44 +185,44 @@ export class PlaywrightChatgptWorker {
   }
 
   async start() {
-    if (this.#context && this.#page) return this.status();
+    if (this.#context && this.#page && this.#authenticated) return this.status();
 
     await this.#launch(this.forceHeaded ? false : true);
-    if (await composerReady(this.#page, 20_000)) {
+    if (await workerReady(this.#page, 20_000)) {
       this.#authenticated = true;
       return this.status();
     }
 
     if (this.#headless) {
-      console.log('[playwright] ChatGPT login is required. Opening the dedicated worker browser for one-time sign-in.');
+      console.log('[playwright] Authenticated ChatGPT login is required. Opening the dedicated worker browser for one-time sign-in.');
       await this.#closeContext();
       await this.#launch(false);
     } else {
-      console.log('[playwright] ChatGPT login is required in the worker browser.');
+      console.log('[playwright] Sign into ChatGPT in the dedicated worker browser.');
     }
 
     const loginDeadline = Date.now() + this.loginTimeoutMs;
     while (Date.now() < loginDeadline) {
-      if (await composerReady(this.#page, 1_000)) {
+      if (await workerReady(this.#page, 1_500)) {
         this.#authenticated = true;
         console.log('[playwright] ChatGPT worker profile is authenticated.');
         break;
       }
       await sleep(500);
     }
-    if (!this.#authenticated) throw new Error('Timed out waiting for ChatGPT login in the Playwright worker browser.');
+    if (!this.#authenticated) throw new Error('Timed out waiting for authenticated ChatGPT login in the Playwright worker browser.');
 
     if (!this.forceHeaded) {
       console.log('[playwright] restarting the authenticated worker headless');
       await this.#closeContext();
       await this.#launch(true);
-      if (!await composerReady(this.#page, 20_000)) {
-        console.log('[playwright] headless ChatGPT startup did not expose the composer; falling back to headed worker mode.');
+      if (!await workerReady(this.#page, 20_000)) {
+        console.log('[playwright] headless ChatGPT startup did not become ready; falling back to headed worker mode.');
         await this.#closeContext();
         await this.#launch(false);
       }
-      this.#authenticated = await composerReady(this.#page, 20_000);
-      if (!this.#authenticated) throw new Error('ChatGPT worker profile is logged in but the composer did not become ready.');
+      this.#authenticated = await workerReady(this.#page, 20_000);
+      if (!this.#authenticated) throw new Error('ChatGPT worker profile is logged in but the authenticated composer did not become ready.');
     }
 
     return this.status();
@@ -210,17 +231,19 @@ export class PlaywrightChatgptWorker {
   async newConversation() {
     await this.start();
     await this.#page.goto(CHATGPT_URL, { waitUntil: 'domcontentloaded', timeout: 60_000 });
-    if (!await composerReady(this.#page, 20_000)) throw new Error('ChatGPT composer is unavailable in the Playwright worker.');
+    if (!await workerReady(this.#page, 20_000)) throw new Error('Authenticated ChatGPT composer is unavailable in the Playwright worker.');
   }
 
   async #sendInternal(prompt) {
     await this.start();
     const page = this.#page;
-    const composer = await firstVisible(page, COMPOSER_SELECTORS);
-    if (!composer) {
+    if (!await sessionAuthenticated(page)) {
       this.#authenticated = false;
-      throw new Error('ChatGPT composer disappeared. The worker may need to log in again.');
+      throw new Error('ChatGPT worker session is no longer authenticated. Restart the launcher to sign in again.');
     }
+
+    const composer = await firstVisible(page, COMPOSER_SELECTORS);
+    if (!composer) throw new Error('ChatGPT composer disappeared from the Playwright worker.');
 
     const beforeCount = await page.locator(ASSISTANT_SELECTOR).count();
     await composer.fill(String(prompt || ''));
