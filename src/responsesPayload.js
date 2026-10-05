@@ -2,7 +2,22 @@ import crypto from 'node:crypto';
 
 const CONTEXT_PREFIXES = ['<environment_context>', '<user_instructions>'];
 const SHELL_TOOL_NAMES = ['exec_command', 'shell_command', 'shell'];
-const MAX_TOOL_CATALOG_CHARS = 48_000;
+const MAX_TOOL_CATALOG_CHARS = 16_000;
+const MAX_TOOL_ENTRY_CHARS = 2_500;
+const TOOL_PRIORITY = [
+  'exec_command',
+  'shell_command',
+  'shell',
+  'write_stdin',
+  'apply_patch',
+  'update_plan',
+  'view_image',
+  'spawn_agent',
+  'send_message',
+  'wait_agent',
+  'followup_task',
+  'request_user_input',
+];
 
 function bounded(text, maxChars) {
   const value = String(text || '');
@@ -117,6 +132,18 @@ function priorToolCall(items, callId, outputIndex) {
   return null;
 }
 
+function latestUserTask(items) {
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    const item = items[index];
+    if (!item || typeof item !== 'object') continue;
+    if ((item.type != null && item.type !== 'message') || item.role !== 'user') continue;
+    const text = responsesContentText(item.content).trim();
+    if (!text || isContextBlob(text)) continue;
+    return text;
+  }
+  return '';
+}
+
 export function extractResponsesTurn(body = {}) {
   const tools = Array.isArray(body.tools) ? body.tools : [];
   const result = {
@@ -151,6 +178,11 @@ export function extractResponsesTurn(body = {}) {
     else if (text.startsWith('<user_instructions>')) result.userInstructions = text;
   }
 
+  // The web-provider adapter intentionally uses stateless upstream browser turns.
+  // Preserve the latest actual user task even when the newest Responses item is a
+  // tool result so every round remains grounded without depending on browser chat history.
+  result.message = latestUserTask(items);
+
   for (let index = items.length - 1; index >= 0; index -= 1) {
     const item = items[index];
     if (!item || typeof item !== 'object') continue;
@@ -162,48 +194,90 @@ export function extractResponsesTurn(body = {}) {
       result.toolName = itemToolName(previousCall) || (item.type === 'local_shell_call_output' ? 'exec_command' : '');
       return result;
     }
-    if ((item.type == null || item.type === 'message') && item.role === 'user') {
-      const text = responsesContentText(item.content).trim();
-      if (!text || isContextBlob(text)) continue;
-      result.message = text;
-      return result;
-    }
   }
 
-  if (typeof body.prompt === 'string') result.message = body.prompt.trim();
+  if (!result.message && typeof body.prompt === 'string') result.message = body.prompt.trim();
   return result;
 }
 
-function compactToolCatalog(tools = []) {
-  const entries = [];
-  const seen = new Set();
-  let used = 0;
+function compactSchema(value, depth = 0) {
+  if (depth > 8) return undefined;
+  if (Array.isArray(value)) {
+    return value.slice(0, 20).map((item) => compactSchema(item, depth + 1)).filter((item) => item !== undefined);
+  }
+  if (!value || typeof value !== 'object') return value;
 
+  const ignored = new Set(['description', 'title', 'examples', 'example', 'default', '$schema', '$id', 'deprecated']);
+  const result = {};
+  for (const [key, child] of Object.entries(value)) {
+    if (ignored.has(key)) continue;
+    const compacted = compactSchema(child, depth + 1);
+    if (compacted !== undefined) result[key] = compacted;
+  }
+  return result;
+}
+
+function toolPriority(name) {
+  const index = TOOL_PRIORITY.indexOf(name);
+  return index === -1 ? TOOL_PRIORITY.length : index;
+}
+
+function compactToolCatalog(tools = []) {
+  const unique = [];
+  const seen = new Set();
   for (const tool of tools) {
     const name = itemToolName(tool);
     const type = itemToolType(tool);
     if (!name || !['function', 'custom'].includes(type) || seen.has(name)) continue;
     seen.add(name);
+    unique.push(tool);
+  }
+  unique.sort((left, right) => {
+    const leftName = itemToolName(left);
+    const rightName = itemToolName(right);
+    return toolPriority(leftName) - toolPriority(rightName) || leftName.localeCompare(rightName);
+  });
 
+  const entries = [];
+  let used = 0;
+  let omitted = 0;
+
+  for (const tool of unique) {
+    const name = itemToolName(tool);
+    const type = itemToolType(tool);
     const entry = {
       name,
       type,
-      description: bounded(itemToolDescription(tool), 1_500),
+      description: bounded(itemToolDescription(tool), 400),
     };
     const parameters = itemToolParameters(tool);
-    if (type === 'function' && parameters) entry.parameters = parameters;
-    if (type === 'custom' && tool.format) entry.format = tool.format;
+    if (type === 'function' && parameters) entry.parameters = compactSchema(parameters);
+    if (type === 'custom' && tool.format) entry.format = compactSchema(tool.format);
 
     let line;
     try { line = JSON.stringify(entry); } catch { continue; }
-    if (used + line.length > MAX_TOOL_CATALOG_CHARS) {
-      entries.push('{"note":"additional advertised tools omitted from prompt because the local tool catalog exceeded the bridge size limit"}');
-      break;
+    if (line.length > MAX_TOOL_ENTRY_CHARS) {
+      const minimal = { name, type, description: entry.description };
+      const required = Array.isArray(parameters?.required) ? parameters.required : [];
+      const properties = parameters?.properties && typeof parameters.properties === 'object'
+        ? Object.fromEntries(Object.entries(parameters.properties).map(([key, spec]) => [key, compactSchema(spec, 6)]))
+        : undefined;
+      if (type === 'function' && (required.length || properties)) {
+        minimal.parameters = { type: 'object', ...(properties ? { properties } : {}), ...(required.length ? { required } : {}) };
+      }
+      line = bounded(JSON.stringify(minimal), MAX_TOOL_ENTRY_CHARS);
+    }
+
+    if (used + line.length + 1 > MAX_TOOL_CATALOG_CHARS) {
+      omitted += 1;
+      continue;
     }
     entries.push(line);
     used += line.length + 1;
   }
 
+  omitted += Math.max(0, unique.length - entries.length - omitted);
+  if (omitted > 0) entries.push(JSON.stringify({ note: `${omitted} additional advertised tool(s) omitted from the browser prompt to stay within the compact catalog budget` }));
   return entries.join('\n');
 }
 
@@ -250,7 +324,7 @@ function protocolForTools(tools) {
     'COMPATIBILITY GENERAL FUNCTION PATH: a fenced `tool` JSON block is also accepted.',
     'COMPATIBILITY GENERAL CUSTOM PATH: a fenced `custom_tool` JSON block is also accepted.',
     'After every tool request, stop and wait for LOCAL TOOL RESULT before deciding the next action. When the task is complete, answer normally with no LOCAL_* call and no tool fence.',
-    'ADVERTISED CODEX TOOLS (one JSON object per line):',
+    'ADVERTISED CODEX TOOLS (compact schemas, one JSON object per line):',
     compactToolCatalog(tools),
   );
 
@@ -266,10 +340,11 @@ export function buildResponsesBridgePrompt(turn) {
   if (turn.userInstructions) pieces.push(`CODEX USER/REPOSITORY INSTRUCTIONS:\n${bounded(turn.userInstructions, 8_000)}`);
 
   if (turn.kind === 'tool_result') {
+    if (turn.message) pieces.push(`ORIGINAL USER TASK:\n${bounded(turn.message, 8_000)}`);
     const source = turn.toolName ? ` from ${turn.toolName}` : '';
     const call = turn.toolCallId ? ` (call ${turn.toolCallId})` : '';
     pieces.push(
-      `LOCAL TOOL RESULT${source}${call}:\n<local_tool_result>\n${bounded(turn.toolOutput, 24_000)}\n</local_tool_result>\nContinue the existing task from this actual local result.`,
+      `LOCAL TOOL RESULT${source}${call}:\n<local_tool_result>\n${bounded(turn.toolOutput, 24_000)}\n</local_tool_result>\nContinue the original task from this actual local result.`,
     );
   } else if (turn.message) {
     pieces.push(`USER TASK:\n${turn.message}`);
