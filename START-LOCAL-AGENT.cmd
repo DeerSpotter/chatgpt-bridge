@@ -23,6 +23,14 @@ if errorlevel 1 (
   exit /b 1
 )
 
+node scripts\provider-session-import-preflight.js
+if errorlevel 1 (
+  echo.
+  echo [local] Session-import preflight failed.
+  pause
+  exit /b 1
+)
+
 node scripts\codex-web-provider-local.js %*
 set "EXIT_CODE=%ERRORLEVEL%"
 
