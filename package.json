@@ -45,6 +45,7 @@
     "scripts/codex-local.js",
     "scripts/codex-web-provider-local.js",
     "scripts/provider-chrome-preflight.js",
+    "scripts/provider-session-import-preflight.js",
     "scripts/codex-playwright-local.js",
     "scripts/extension-install.js",
     "scripts/workflow-init.js",
