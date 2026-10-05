@@ -35,7 +35,7 @@ test('extractResponsesTurn keeps Codex context separate from the real user task'
   assert.match(turn.userInstructions, /keep changes small/);
 });
 
-test('latest tool result becomes the next ChatGPT web turn and keeps tool identity', () => {
+test('latest tool result keeps tool identity and original task for stateless web turns', () => {
   const turn = extractResponsesTurn({
     tools: [{ type: 'function', name: 'write_stdin' }],
     input: [
@@ -46,10 +46,13 @@ test('latest tool result becomes the next ChatGPT web turn and keeps tool identi
   });
 
   assert.equal(turn.kind, 'tool_result');
+  assert.equal(turn.message, 'inspect the repo');
   assert.equal(turn.toolName, 'write_stdin');
   assert.equal(turn.toolCallId, 'call_1');
   assert.match(turn.toolOutput, /process finished/);
-  assert.match(buildResponsesBridgePrompt(turn), /LOCAL TOOL RESULT from write_stdin/);
+  const prompt = buildResponsesBridgePrompt(turn);
+  assert.match(prompt, /ORIGINAL USER TASK:\ninspect the repo/);
+  assert.match(prompt, /LOCAL TOOL RESULT from write_stdin/);
 });
 
 test('render-safe LOCAL_TOOL_CALL maps advertised exec_command', () => {
@@ -174,6 +177,37 @@ test('bridge prompt includes live advertised function schema and render-safe pro
   assert.match(prompt, /ADVERTISED CODEX TOOLS/);
   assert.match(prompt, /write_stdin/);
   assert.match(prompt, /session_id/);
+});
+
+test('browser prompt keeps a large advertised tool set bounded', () => {
+  const tools = Array.from({ length: 40 }, (_, index) => ({
+    type: 'function',
+    name: index === 0 ? 'exec_command' : `mcp_tool_${index}`,
+    description: 'Long provider description '.repeat(100),
+    parameters: {
+      type: 'object',
+      properties: Object.fromEntries(Array.from({ length: 20 }, (__, propertyIndex) => [
+        `property_${propertyIndex}`,
+        { type: 'string', description: 'Schema description '.repeat(30) },
+      ])),
+      required: ['property_0'],
+    },
+  }));
+
+  const prompt = buildResponsesBridgePrompt({
+    kind: 'user',
+    message: 'inspect the repository',
+    toolOutput: '',
+    toolName: '',
+    toolCallId: '',
+    environmentContext: '',
+    userInstructions: '',
+    tools,
+  });
+
+  assert.match(prompt, /exec_command/);
+  assert.match(prompt, /additional advertised tool/);
+  assert.ok(prompt.length < 22_000, `expected compact browser prompt, got ${prompt.length} chars`);
 });
 
 test('normal answer does not become a tool call', () => {
