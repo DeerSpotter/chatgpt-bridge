@@ -4,7 +4,6 @@ import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 
 import {
@@ -16,8 +15,6 @@ import {
   parseResponsesToolCall,
 } from '../src/responsesPayload.js';
 
-const here = path.dirname(fileURLToPath(import.meta.url));
-path.resolve(here, '..');
 const bridgeHome = path.resolve(process.env.CHATGPT_BRIDGE_HOME || path.join(os.homedir(), '.bridge-data'));
 const providerCheckout = path.resolve(process.env.CHATGPT_WEB_PROVIDER_CHECKOUT || path.join(bridgeHome, 'vendor', 'chatgpt-web-provider'));
 const providerHome = path.resolve(process.env.CHATGPT_WEB_PROVIDER_HOME || path.join(bridgeHome, 'chatgpt-web-provider'));
@@ -198,7 +195,7 @@ async function ensureProviderCheckout() {
   if (!existingDir(path.join(providerCheckout, '.git'))) {
     ensureDir(path.dirname(providerCheckout));
     console.log(`[bootstrap] cloning chatgpt-web-provider into ${providerCheckout}`);
-    const clone = await spawnCapture(git, ['clone', '--filter=blob:none', '--no-checkout', providerRepo, providerCheckout]);
+    const clone = await spawnCapture(git, ['clone', '--filter=blob:none', providerRepo, providerCheckout]);
     if (clone.code !== 0) throw new Error(`Unable to clone chatgpt-web-provider: ${clone.stderr || clone.stdout}`);
   }
 
@@ -210,7 +207,7 @@ async function ensureProviderCheckout() {
 
   const head = await spawnCapture(git, ['-C', providerCheckout, 'rev-parse', 'HEAD']);
   const current = head.code === 0 ? head.stdout.trim() : '';
-  if (current !== providerCommit) {
+  if (current !== providerCommit || !existingFile(path.join(providerCheckout, 'package.json'))) {
     console.log(`[bootstrap] pinning chatgpt-web-provider to ${providerCommit.slice(0, 12)}`);
     const fetchResult = await spawnCapture(git, ['-C', providerCheckout, 'fetch', '--depth', '1', 'origin', providerCommit]);
     if (fetchResult.code !== 0) throw new Error(`Unable to fetch pinned provider commit: ${fetchResult.stderr || fetchResult.stdout}`);
